@@ -1,5 +1,7 @@
 package com.example.cavearchive
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -10,6 +12,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -26,6 +29,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -33,8 +37,10 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.FormatPaint
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
@@ -152,6 +158,7 @@ fun MainScreen() {
 
     var isSyncing by remember { mutableStateOf(false) }
     var isCancelled by remember { mutableStateOf(false) }
+    var syncJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     var isSignedIn by remember { mutableStateOf(GoogleSignIn.getLastSignedInAccount(context) != null) }
 
     val logs = remember { mutableStateListOf<LogMessage>() }
@@ -401,7 +408,10 @@ fun MainScreen() {
                     Text(status, modifier = Modifier.padding(top = 8.dp))
                     if (!isCancelled) {
                         Button(
-                            onClick = { isCancelled = true },
+                            onClick = { 
+                                isCancelled = true
+                                syncJob?.cancel()
+                            },
                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                             modifier = Modifier.padding(top = 8.dp)
                         ) { Text("Stop Sync") }
@@ -419,7 +429,7 @@ fun MainScreen() {
                                 if (selectedArchive == null || selectedFolderUri == null) {
                                     addLog("Configure URL and folder!", Color.Red)
                                 } else {
-                                    scope.launch {
+                                    syncJob = scope.launch {
                                         try {
                                             isSyncing = true
                                             isCancelled = false
@@ -429,7 +439,11 @@ fun MainScreen() {
                                             addLog(msg, if (res) Color.Green else Color.Red)
                                         } catch (t: Throwable) {
                                             isSyncing = false
-                                            addLog("ERROR: ${t.localizedMessage}", Color.Red)
+                                            if (t !is kotlinx.coroutines.CancellationException) {
+                                                addLog("ERROR: ${t.localizedMessage}", Color.Red)
+                                            }
+                                        } finally {
+                                            syncJob = null
                                         }
                                     }
                                 }
@@ -443,7 +457,38 @@ fun MainScreen() {
             Box(modifier = Modifier.weight(1f).fillMaxWidth().background(Color.Black, RoundedCornerShape(8.dp)).padding(8.dp)) {
                 LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                     items(logs) { log ->
-                        Text("[${log.time}] > ${log.text}", color = log.color, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                        Text("[${log.time}] ${log.text}", color = log.color, fontFamily = FontFamily.Monospace, fontSize = 8.sp)
+                    }
+                }
+                Column(
+                    modifier = Modifier.align(Alignment.BottomEnd),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    IconButton(
+                        onClick = {
+                            val content = logs.joinToString("\n") { "[${it.time}] ${it.text}" }
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            val clip = ClipData.newPlainText("Console Logs", content)
+                            clipboard.setPrimaryClip(clip)
+                            Toast.makeText(context, "Logs copied to clipboard", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.ContentCopy,
+                            contentDescription = "Copy Console",
+                            tint = Color.Gray.copy(alpha = 0.7f)
+                        )
+                    }
+                    IconButton(
+                        onClick = { logs.clear() },
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.FormatPaint,
+                            contentDescription = "Clear Console",
+                            tint = Color.Gray.copy(alpha = 0.7f)
+                        )
                     }
                 }
             }
@@ -659,10 +704,11 @@ suspend fun wipeManagedData(
                     val surveysDeleted = db.delete("surveys", "comment = ?", arrayOf("CaveArchiveManaged"))
                     db.setTransactionSuccessful()
                     
-                    // Delete supporting files and inventory
+        // Delete supporting files and inventory
                     val parent = DocumentFile.fromTreeUri(context, localFolderUri)
                     val archiveFolder = parent?.findFile("CaveArchive")
                     val inventoryFile = archiveFolder?.findFile("CaveArchive_files.json")
+                    val synchedCavesFile = archiveFolder?.findFile("CaveArchive_synched_caves.json")
                     
                     if (inventoryFile != null) {
                         try {
@@ -672,10 +718,10 @@ suspend fun wipeManagedData(
                                 val array = json.getJSONArray("downloaded_files")
                                 var deletedFilesCount = 0
                                 for (i in 0 until array.length()) {
-                                    val path = array.getString(i)
+                                    val item = array.get(i)
+                                    val path = if (item is JSONObject) item.getString("path") else item.toString()
                                     val parts = path.split("/")
                                     if (parts.size == 2) {
-                                        // Cerca la sottocartella (es. DTM) e poi il file
                                         parent?.findFile(parts[0])?.findFile(parts[1])?.delete()
                                         deletedFilesCount++
                                     }
@@ -687,6 +733,7 @@ suspend fun wipeManagedData(
                         } catch (e: Exception) { e.printStackTrace() }
                         inventoryFile.delete()
                     }
+                    synchedCavesFile?.delete()
 
                     withContext(Dispatchers.Main) {
                         onLog("Deleted $surveysDeleted surveys, $shotsDeleted shots and $fixedDeleted fixed points.", Color.Yellow)
@@ -715,12 +762,26 @@ suspend fun syncDriveFolderOAuth(
     context: Context, urlString: String, localFolderUri: Uri, onLog: (String, Color) -> Unit, checkCancelled: () -> Boolean
 ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
     suspend fun safeLog(text: String, color: Color = Color.White) = withContext(Dispatchers.Main) { onLog(text, color) }
-    suspend fun <T> runWithRetry(name: String, block: suspend () -> T): T {
+    suspend fun <T> runWithRetry(name: String, block: () -> T): T {
         var lastEx: Throwable? = null
         for (i in 1..3) {
-            if (checkCancelled()) throw Exception("Annullato")
-            try { return withTimeout(120000) { block() } }
-            catch (t: Throwable) { lastEx = t; if (i < 3) { safeLog("Retry $i: $name", Color.Yellow); delay(2000) } }
+            if (checkCancelled()) throw kotlinx.coroutines.CancellationException()
+            try {
+                return withTimeout(120000) {
+                    kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
+                        block()
+                    }
+                }
+            } catch (t: Throwable) {
+                if (t is kotlinx.coroutines.CancellationException && t !is kotlinx.coroutines.TimeoutCancellationException) {
+                    throw t
+                }
+                lastEx = t
+                if (i < 3) {
+                    safeLog("Retry $i: $name", Color.Yellow)
+                    delay(2000)
+                }
+            }
         }
         throw lastEx ?: Exception("Timeout $name")
     }
@@ -737,11 +798,43 @@ suspend fun syncDriveFolderOAuth(
         if (folderId == null) return@withContext false to "Invalid URL"
 
         safeLog("Connecting to Drive...", Color.Cyan)
-        val driveFiles = runWithRetry("file list") { drive.files().list().setQ("'$folderId' in parents and trashed = false").setFields("files(id, name, mimeType)").execute() }.files ?: emptyList()
+        val driveFiles = runWithRetry("file list") { drive.files().list().setQ("'$folderId' in parents and trashed = false").setFields("files(id, name, mimeType, modifiedTime)").execute() }.files ?: emptyList()
         val caveJsonFile = driveFiles.find { it.name == "Cave.json" } ?: return@withContext false to "Cave.json not found"
 
         val parentFolder = DocumentFile.fromTreeUri(context, localFolderUri) ?: return@withContext false to "Local folder error"
         val dbDocFile = parentFolder.findFile("distox14.sqlite")
+
+        val synchedCavesList = mutableListOf<JSONObject>()
+        var updatedCavesCount = 0
+        
+        // Load existing synched caves and files inventory
+        val existingSynchedCaves = mutableMapOf<String, JSONObject>()
+        val existingFilesMetadata = mutableMapOf<String, JSONObject>()
+        try {
+            val archiveFolder = parentFolder.findFile("CaveArchive")
+            
+            archiveFolder?.findFile("CaveArchive_synched_caves.json")?.let { file ->
+                val jsonStr = context.contentResolver.openInputStream(file.uri)?.use { it.bufferedReader().readText() } ?: ""
+                if (jsonStr.isNotBlank()) {
+                    val array = JSONObject(jsonStr).getJSONArray("synched_caves")
+                    for (i in 0 until array.length()) {
+                        val obj = array.getJSONObject(i)
+                        existingSynchedCaves[obj.getString("file_name")] = obj
+                    }
+                }
+            }
+            
+            archiveFolder?.findFile("CaveArchive_files.json")?.let { file ->
+                val jsonStr = context.contentResolver.openInputStream(file.uri)?.use { it.bufferedReader().readText() } ?: ""
+                if (jsonStr.isNotBlank()) {
+                    val array = JSONObject(jsonStr).getJSONArray("downloaded_files")
+                    for (i in 0 until array.length()) {
+                        val obj = array.optJSONObject(i)
+                        if (obj != null) existingFilesMetadata[obj.getString("path")] = obj
+                    }
+                }
+            }
+        } catch (e: Exception) { e.printStackTrace() }
 
         if (dbDocFile != null) {
             val suffix = System.currentTimeMillis()
@@ -806,31 +899,52 @@ suspend fun syncDriveFolderOAuth(
                             if (cave.has("shotsFile") && !checkCancelled()) {
                                 val sName = cave.getString("shotsFile")
                                 driveFiles.find { it.name == sName }?.let { sFile ->
-                                    val tShots = JFile(context.cacheDir, "temp_shots_$suffix.sqlite")
-                                    runWithRetry("download $sName") { drive.files().get(sFile.id).executeMediaAsInputStream().use { inp -> FileOutputStream(tShots).use { inp.copyTo(it) } } }
-                                    SQLiteDatabase.openDatabase(tShots.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { sDb ->
-                                        db.delete("shots", "surveyId = ?", arrayOf(sId.toString()))
-                                        sDb.query("shots", null, null, null, null, null, null).use { sc ->
-                                            if (cursorToFirst(sc)) do {
-                                                val row = ContentValues()
-                                                for (col in sc.columnNames) {
-                                                    if (col == "comment") continue
-                                                    val idx = sc.getColumnIndex(col)
-                                                    when (sc.getType(idx)) {
-                                                        Cursor.FIELD_TYPE_INTEGER -> row.put(col, sc.getLong(idx))
-                                                        Cursor.FIELD_TYPE_FLOAT -> row.put(col, sc.getDouble(idx))
-                                                        Cursor.FIELD_TYPE_STRING -> row.put(col, sc.getString(idx))
-                                                        Cursor.FIELD_TYPE_BLOB -> row.put(col, sc.getBlob(idx))
+                                    val currentModifiedTime = sFile.modifiedTime?.toString() ?: ""
+                                    val existingInfo = existingSynchedCaves[sName]
+                                    
+                                    val needsUpdate = existingInfo == null || 
+                                                     existingInfo.optString("drive_id") != sFile.id || 
+                                                     existingInfo.optString("modified_time") != currentModifiedTime
+
+                                    if (!needsUpdate && existingInfo != null) {
+                                        safeLog("$sName is up to date, skipping measurements.", Color.Gray)
+                                        synchedCavesList.add(existingInfo)
+                                    } else {
+                                        val tShots = JFile(context.cacheDir, "temp_shots_$suffix.sqlite")
+                                        runWithRetry("download $sName") { drive.files().get(sFile.id).executeMediaAsInputStream().use { inp -> FileOutputStream(tShots).use { inp.copyTo(it) } } }
+                                        
+                                        // Track synched cave info
+                                        synchedCavesList.add(JSONObject().apply {
+                                            put("file_name", sName)
+                                            put("drive_id", sFile.id)
+                                            put("modified_time", currentModifiedTime)
+                                        })
+
+                                        SQLiteDatabase.openDatabase(tShots.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { sDb ->
+                                            db.delete("shots", "surveyId = ?", arrayOf(sId.toString()))
+                                            sDb.query("shots", null, null, null, null, null, null).use { sc ->
+                                                if (cursorToFirst(sc)) do {
+                                                    val row = ContentValues()
+                                                    for (col in sc.columnNames) {
+                                                        if (col == "comment") continue
+                                                        val idx = sc.getColumnIndex(col)
+                                                        when (sc.getType(idx)) {
+                                                            Cursor.FIELD_TYPE_INTEGER -> row.put(col, sc.getLong(idx))
+                                                            Cursor.FIELD_TYPE_FLOAT -> row.put(col, sc.getDouble(idx))
+                                                            Cursor.FIELD_TYPE_STRING -> row.put(col, sc.getString(idx))
+                                                            Cursor.FIELD_TYPE_BLOB -> row.put(col, sc.getBlob(idx))
+                                                        }
                                                     }
-                                                }
-                                                row.put("comment", "CaveArchiveManaged")
-                                                row.put("surveyId", sId)
-                                                db.insertWithOnConflict("shots", null, row, SQLiteDatabase.CONFLICT_REPLACE)
-                                            } while (sc.moveToNext())
-                                            safeLog("  + ${sc.count} measurements ($name)", Color.Gray)
+                                                    row.put("comment", "CaveArchiveManaged")
+                                                    row.put("surveyId", sId)
+                                                    db.insertWithOnConflict("shots", null, row, SQLiteDatabase.CONFLICT_REPLACE)
+                                                } while (sc.moveToNext())
+                                                safeLog("${sc.count} measurements ($name)", Color.Gray)
+                                            }
                                         }
+                                        tShots.delete()
+                                        updatedCavesCount++
                                     }
-                                    tShots.delete()
                                 }
                             }
                         }
@@ -838,15 +952,26 @@ suspend fun syncDriveFolderOAuth(
                     } finally { if (db.inTransaction()) db.endTransaction() }
                 }
                 if (!checkCancelled()) {
-                    context.contentResolver.openOutputStream(dbDocFile.uri, "wt")?.use { out -> tempDb.inputStream().use { input -> input.copyTo(out) }; out.flush() }
-                    safeLog("Database updated.", Color.Green)
+                    withContext(kotlinx.coroutines.NonCancellable) {
+                        context.contentResolver.openOutputStream(dbDocFile.uri, "wt")?.use { out -> 
+                            tempDb.inputStream().use { input -> input.copyTo(out) }
+                            out.flush() 
+                        }
+                        
+                        // Save synched caves inventory
+                        if (synchedCavesList.isNotEmpty()) {
+                            updateSynchedCavesInventory(context, localFolderUri, synchedCavesList)
+                        }
+
+                        safeLog("Database updated: $updatedCavesCount sqlite files processed.", Color.Green)
+                    }
                 }
             } catch (e: Exception) { safeLog("DB Error: ${e.localizedMessage}", Color.Red) }
             finally { tempDb.delete() }
         }
 
         var dlCount = 0
-        val downloadedPaths = mutableListOf<String>()
+        val downloadedPathsMetadata = mutableListOf<JSONObject>()
         for (f in driveFiles) {
             if (checkCancelled()) break
             if (f.name == "Cave.json" || f.name.lowercase().endsWith(".zip")) continue
@@ -855,13 +980,32 @@ suspend fun syncDriveFolderOAuth(
                 f.name.lowercase().endsWith(".asc") || f.name.lowercase().endsWith(".asci") || f.name.lowercase().endsWith(".ascii") -> "DTM"
                 else -> null
             } ?: continue
+            
+            val path = "$folderName/${f.name}"
+            val currentModifiedTime = f.modifiedTime?.toString() ?: ""
+            val existing = existingFilesMetadata[path]
+            
+            val needsUpdate = existing == null || 
+                             existing.optString("drive_id") != f.id || 
+                             existing.optString("modified_time") != currentModifiedTime
+
+            if (!needsUpdate && existing != null) {
+                safeLog("${f.name} is up to date.", Color.Gray)
+                downloadedPathsMetadata.add(existing)
+                continue
+            }
+
             val dest = parentFolder.findFile(folderName) ?: parentFolder.createDirectory(folderName)
             dest?.let { d ->
                 runWithRetry("download ${f.name}") {
                     val target = d.findFile(f.name) ?: d.createFile(f.mimeType, f.name)
                     target?.let { t -> 
                         context.contentResolver.openOutputStream(t.uri)?.use { drive.files().get(f.id).executeMediaAndDownloadTo(it) }
-                        downloadedPaths.add("$folderName/${f.name}")
+                        downloadedPathsMetadata.add(JSONObject().apply {
+                            put("path", path)
+                            put("drive_id", f.id)
+                            put("modified_time", currentModifiedTime)
+                        })
                     }
                 }
                 safeLog("Saved: ${f.name}", Color.Gray)
@@ -869,17 +1013,17 @@ suspend fun syncDriveFolderOAuth(
             }
         }
         
-        if (downloadedPaths.isNotEmpty()) {
-            updateFilesInventory(context, localFolderUri, downloadedPaths)
+        if (downloadedPathsMetadata.isNotEmpty()) {
+            updateFilesInventory(context, localFolderUri, downloadedPathsMetadata)
         }
 
-        return@withContext true to (if (checkCancelled()) "Interrupted." else "Completed! $dlCount files downloaded.")
+        return@withContext true to (if (checkCancelled()) "Interrupted." else "Files updated: $dlCount files downloaded.")
     } catch (t: Throwable) { return@withContext false to "Error: ${t.localizedMessage}" }
 }
 
 private fun cursorToFirst(c: Cursor?): Boolean = c?.moveToFirst() ?: false
 
-suspend fun updateFilesInventory(context: Context, folderUri: Uri, newPaths: List<String>) = withContext(Dispatchers.IO) {
+suspend fun updateFilesInventory(context: Context, folderUri: Uri, newItems: List<JSONObject>) = withContext(Dispatchers.IO) {
     try {
         val parent = DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext
         val folder = parent.findFile("CaveArchive") ?: parent.createDirectory("CaveArchive") ?: return@withContext
@@ -889,10 +1033,19 @@ suspend fun updateFilesInventory(context: Context, folderUri: Uri, newPaths: Lis
         val json = if (existingContent.isNotBlank()) JSONObject(existingContent) else JSONObject().apply { put("downloaded_files", JSONArray()) }
         val array = json.getJSONArray("downloaded_files")
         
-        val currentSet = mutableSetOf<String>()
-        for (i in 0 until array.length()) { currentSet.add(array.getString(i)) }
-        
-        newPaths.forEach { if (currentSet.add(it)) array.put(it) }
+        newItems.forEach { newItem ->
+            val path = newItem.getString("path")
+            var found = false
+            for (i in 0 until array.length()) {
+                val existing = array.optJSONObject(i)
+                if (existing != null && existing.getString("path") == path) {
+                    array.put(i, newItem)
+                    found = true
+                    break
+                }
+            }
+            if (!found) array.put(newItem)
+        }
         
         context.contentResolver.openOutputStream(file.uri, "wt")?.use { it.write(json.toString(2).toByteArray()) }
     } catch (e: Exception) { e.printStackTrace() }
