@@ -308,7 +308,7 @@ fun MainScreen() {
                     Text("Are you sure you want to delete all data synchronized with CaveArchive?")
                     Spacer(Modifier.height(16.dp))
                     Text(
-                        "All objects with the comment 'CaveArchiveManaged' in 'surveys' and 'shots' tables will be permanently removed.",
+                        "All data managed by CaveArchive (marked in the 'caveArchive' column) across surveys, shots, and fixed points tables will be permanently removed.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error
                     )
@@ -699,9 +699,10 @@ suspend fun wipeManagedData(
                             SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
                 db.beginTransaction()
                 try {
-                    val fixedDeleted = db.delete("fixeds", "comment = ?", arrayOf("CaveArchiveManaged"))
-                    val shotsDeleted = db.delete("shots", "comment = ?", arrayOf("CaveArchiveManaged"))
-                    val surveysDeleted = db.delete("surveys", "comment = ?", arrayOf("CaveArchiveManaged"))
+                    ensureCaveArchiveColumn(db)
+                    val fixedDeleted = db.delete("fixeds", "caveArchive = 1", null)
+                    val shotsDeleted = db.delete("shots", "caveArchive = 1", null)
+                    val surveysDeleted = db.delete("surveys", "caveArchive = 1", null)
                     db.setTransactionSuccessful()
                     
         // Delete supporting files and inventory
@@ -757,6 +758,25 @@ suspend fun wipeManagedData(
 }
 
 fun getDisplayName(uri: Uri): String = uri.path?.split(":")?.lastOrNull() ?: uri.toString()
+
+fun ensureCaveArchiveColumn(db: SQLiteDatabase) {
+    val tables = listOf("surveys", "shots", "fixeds")
+    for (table in tables) {
+        val cursor = db.rawQuery("PRAGMA table_info($table)", null)
+        var exists = false
+        cursor.use {
+            while (it.moveToNext()) {
+                if (it.getString(it.getColumnIndexOrThrow("name")) == "caveArchive") {
+                    exists = true
+                    break
+                }
+            }
+        }
+        if (!exists) {
+            db.execSQL("ALTER TABLE $table ADD COLUMN caveArchive INTEGER DEFAULT 0")
+        }
+    }
+}
 
 suspend fun syncDriveFolderOAuth(
     context: Context, urlString: String, localFolderUri: Uri, onLog: (String, Color) -> Unit, checkCancelled: () -> Boolean
@@ -846,6 +866,7 @@ suspend fun syncDriveFolderOAuth(
                 context.contentResolver.openInputStream(dbDocFile.uri)?.use { input -> FileOutputStream(tempDb).use { input.copyTo(it) } }
 
                 SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
+                    ensureCaveArchiveColumn(db)
                     db.beginTransaction()
                     try {
                         for (i in 0 until caves.length()) {
@@ -854,7 +875,9 @@ suspend fun syncDriveFolderOAuth(
                             val name = cave.getString("name")
                             val vals = ContentValues().apply {
                                 put("name", name); put("day", cave.optString("day", "")); put("team", cave.optString("team", ""))
-                                put("comment", "CaveArchiveManaged"); put("declination", cave.optDouble("declination", 0.0))
+                                put("comment", cave.optString("comment", ""))
+                                put("caveArchive", 1)
+                                put("declination", cave.optDouble("declination", 0.0))
                                 put("init_station", cave.optString("init_station", "")); put("xsections", 0); put("datamode", 0)
                                 put("extend", 0); put("created", 0); put("immutable", 0)
                             }
@@ -875,7 +898,8 @@ suspend fun syncDriveFolderOAuth(
                                     val alt = f.optDouble("altimetric", 0.0)
                                     put("altitude", f.optDouble("altitude", 0.0))
                                     put("altimetric", alt)
-                                    put("comment", "CaveArchiveManaged")
+                                    put("comment", "")
+                                    put("caveArchive", 1)
                                     put("status", 0)
                                     put("cs_name", "")
                                     put("cs_longitude", 0.0)
@@ -926,7 +950,6 @@ suspend fun syncDriveFolderOAuth(
                                                 if (cursorToFirst(sc)) do {
                                                     val row = ContentValues()
                                                     for (col in sc.columnNames) {
-                                                        if (col == "comment") continue
                                                         val idx = sc.getColumnIndex(col)
                                                         when (sc.getType(idx)) {
                                                             Cursor.FIELD_TYPE_INTEGER -> row.put(col, sc.getLong(idx))
@@ -935,7 +958,7 @@ suspend fun syncDriveFolderOAuth(
                                                             Cursor.FIELD_TYPE_BLOB -> row.put(col, sc.getBlob(idx))
                                                         }
                                                     }
-                                                    row.put("comment", "CaveArchiveManaged")
+                                                    row.put("caveArchive", 1)
                                                     row.put("surveyId", sId)
                                                     db.insertWithOnConflict("shots", null, row, SQLiteDatabase.CONFLICT_REPLACE)
                                                 } while (sc.moveToNext())
