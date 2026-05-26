@@ -48,6 +48,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -113,7 +114,7 @@ import java.util.zip.ZipInputStream
 import java.io.File as JFile
 
 data class LogMessage(val text: String, val color: Color, val time: String)
-data class ArchiveConfig(val name: String, val url: String)
+data class ArchiveConfig(val id: Int = 0, val name: String, val url: String)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -141,6 +142,8 @@ fun MainScreen() {
     var showPermissionDialog by remember { mutableStateOf(false) }
     var showInfoDialog by remember { mutableStateOf(false) }
     var showWipeDialog by remember { mutableStateOf(false) }
+    var wipeAllData by remember { mutableStateOf(true) }
+    var archiveToWipe by remember { mutableStateOf<ArchiveConfig?>(null) }
     var showMenu by remember { mutableStateOf(false) }
     var showManageArchivesDialog by remember { mutableStateOf(false) }
 
@@ -201,19 +204,23 @@ fun MainScreen() {
     // Carica le impostazioni quando cambia la cartella
     LaunchedEffect(selectedFolderUri) {
         selectedFolderUri?.let { uri ->
-            archives = emptyList()
-            val loaded = loadSettings(context, uri)
-            archives = loaded
-            val lastUrl = sharedPrefs.getString(KEY_ARCHIVE_URL, "")
-            selectedArchive = loaded.find { it.url == lastUrl } ?: loaded.firstOrNull()
+            scope.launch {
+                migrateJsonToDb(context, uri)
+                archives = emptyList()
+                val loaded = loadSettings(context, uri)
+                archives = loaded
+                val lastUrl = sharedPrefs.getString(KEY_ARCHIVE_URL, "")
+                selectedArchive = loaded.find { it.url == lastUrl } ?: loaded.firstOrNull()
+            }
         }
     }
 
     fun saveAndRefreshArchives(newList: List<ArchiveConfig>) {
-        archives = newList
         selectedFolderUri?.let { uri ->
             scope.launch {
                 saveSettings(context, uri, newList)
+                // Reload immediately to get correctly assigned IDs from DB
+                archives = loadSettings(context, uri)
             }
         }
     }
@@ -304,11 +311,40 @@ fun MainScreen() {
             onDismissRequest = { showWipeDialog = false },
             title = { Text("Wipe Managed Data") },
             text = {
-                Column {
-                    Text("Are you sure you want to delete all data synchronized with CaveArchive?")
-                    Spacer(Modifier.height(16.dp))
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Are you sure you want to delete data synchronized with CaveArchive?")
+                    
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(checked = wipeAllData, onCheckedChange = { wipeAllData = it })
+                        Text("Wipe all data", modifier = Modifier.clickable { wipeAllData = !wipeAllData })
+                    }
+
+                    if (!wipeAllData) {
+                        var expanded by remember { mutableStateOf(false) }
+                        Text("Select archive:", style = MaterialTheme.typography.labelLarge)
+                        Box {
+                            Button(
+                                onClick = { expanded = true },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant, contentColor = MaterialTheme.colorScheme.onSurfaceVariant),
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text(archiveToWipe?.name ?: "Select Archive", maxLines = 1, textAlign = TextAlign.Start, modifier = Modifier.fillMaxWidth())
+                            }
+                            DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                                archives.forEach { arch ->
+                                    DropdownMenuItem(text = { Text(arch.name) }, onClick = {
+                                        archiveToWipe = arch
+                                        expanded = false
+                                    })
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(8.dp))
                     Text(
-                        "All data managed by CaveArchive (marked in the 'caveArchive' column) across surveys, shots, and fixed points tables will be permanently removed.",
+                        "Only data managed by CaveArchive (marked in the 'caveArchive' column) will be removed. Your personal surveys will remain safe.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error
                     )
@@ -317,12 +353,17 @@ fun MainScreen() {
             confirmButton = {
                 TextButton(
                     onClick = {
-                        showWipeDialog = false
-                        selectedFolderUri?.let { uri ->
-                            scope.launch {
-                                val (success, msg) = wipeManagedData(context, uri, ::addLog)
-                                addLog(msg, if (success) Color.Green else Color.Red)
+                        val targetId = if (wipeAllData) null else archiveToWipe?.id
+                        if (wipeAllData || (targetId != null && targetId > 0)) {
+                            showWipeDialog = false
+                            selectedFolderUri?.let { uri ->
+                                scope.launch {
+                                    val (success, msg) = wipeManagedData(context, uri, targetId, ::addLog)
+                                    addLog(msg, if (success) Color.Green else Color.Red)
+                                }
                             }
+                        } else if (!wipeAllData && targetId == 0) {
+                            addLog("Error: Archive ID not valid. Please restart the app.", Color.Red)
                         }
                     }
                 ) { Text("Confirm") }
@@ -341,7 +382,7 @@ fun MainScreen() {
             onDismiss = { showManageArchivesDialog = false },
             onSave = { newList ->
                 saveAndRefreshArchives(newList)
-                if (selectedArchive !in newList) {
+                if (selectedArchive == null || newList.none { it.id == selectedArchive?.id }) {
                     selectedArchive = newList.firstOrNull()
                     sharedPrefs.edit { putString(KEY_ARCHIVE_URL, selectedArchive?.url ?: "") }
                 }
@@ -434,7 +475,7 @@ fun MainScreen() {
                                             isSyncing = true
                                             isCancelled = false
                                             addLog("Sync started...", Color.Cyan)
-                                            val (res, msg) = syncDriveFolderOAuth(context, selectedArchive!!.url, selectedFolderUri!!, ::addLog, { isCancelled })
+                                            val (res, msg) = syncDriveFolderOAuth(context, selectedArchive!!, selectedFolderUri!!, ::addLog, { isCancelled })
                                             isSyncing = false
                                             addLog(msg, if (res) Color.Green else Color.Red)
                                         } catch (t: Throwable) {
@@ -613,7 +654,7 @@ fun ManageArchivesDialog(
                                     )
                                 }
                                 IconButton(onClick = { editingArchive = arch; showAddDialog = true }) { Icon(Icons.Default.Edit, null) }
-                                IconButton(onClick = { list = list.filter { it != arch } }) { Icon(Icons.Default.Delete, null, tint = Color.Red) }
+                                IconButton(onClick = { list = list.filter { it.id != arch.id || (it.id == 0 && it != arch) } }) { Icon(Icons.Default.Delete, null, tint = Color.Red) }
                             }
                             HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
                         }
@@ -644,8 +685,8 @@ fun ManageArchivesDialog(
             confirmButton = {
                 TextButton(onClick = {
                     if (name.isNotBlank() && url.isNotBlank()) {
-                        val newArch = ArchiveConfig(name, url)
-                        list = if (editingArchive == null) list + newArch else list.map { if (it == editingArchive) newArch else it }
+                        val newArch = ArchiveConfig(id = editingArchive?.id ?: 0, name = name, url = url)
+                        list = if (editingArchive == null) list + newArch else list.map { if (it.id == editingArchive?.id) newArch else it }
                         showAddDialog = false
                     }
                 }) { Text("OK") }
@@ -657,33 +698,76 @@ fun ManageArchivesDialog(
 suspend fun loadSettings(context: Context, folderUri: Uri): List<ArchiveConfig> = withContext(Dispatchers.IO) {
     try {
         val parent = DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext emptyList()
-        val settingsFile = parent.findFile("CaveArchive")?.findFile("CaveArchive_Settings.json") ?: return@withContext emptyList()
-        val jsonStr = context.contentResolver.openInputStream(settingsFile.uri)?.use { it.bufferedReader().readText() } ?: ""
-        val array = JSONObject(jsonStr).getJSONArray("archives")
-        List(array.length()) { i ->
-            val obj = array.getJSONObject(i)
-            ArchiveConfig(obj.getString("name"), obj.getString("url"))
+        val dbFile = parent.findFile("distox14.sqlite") ?: return@withContext emptyList()
+        
+        val tempDb = JFile(context.cacheDir, "load_settings_temp.sqlite")
+        context.contentResolver.openInputStream(dbFile.uri)?.use { input ->
+            FileOutputStream(tempDb).use { output -> input.copyTo(output) }
         }
-    } catch (e: Exception) { emptyList() }
+        
+        val result = mutableListOf<ArchiveConfig>()
+        SQLiteDatabase.openDatabase(tempDb.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { db ->
+            ensureCaveArchiveColumn(db)
+            db.query("CA_Archives", null, null, null, null, null, null).use { cursor ->
+                while (cursor.moveToNext()) {
+                    result.add(ArchiveConfig(
+                        id = cursor.getInt(cursor.getColumnIndexOrThrow("id")),
+                        name = cursor.getString(cursor.getColumnIndexOrThrow("name")),
+                        url = cursor.getString(cursor.getColumnIndexOrThrow("url"))
+                    ))
+                }
+            }
+        }
+        tempDb.delete()
+        result
+    } catch (e: Exception) {
+        emptyList()
+    }
 }
 
 suspend fun saveSettings(context: Context, folderUri: Uri, archives: List<ArchiveConfig>) = withContext(Dispatchers.IO) {
     try {
         val parent = DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext
-        val folder = parent.findFile("CaveArchive") ?: parent.createDirectory("CaveArchive") ?: return@withContext
-        val file = folder.findFile("CaveArchive_Settings.json") ?: folder.createFile("application/json", "CaveArchive_Settings.json") ?: return@withContext
-        val json = JSONObject().apply {
-            put("archives", JSONArray().apply {
-                archives.forEach { put(JSONObject().apply { put("name", it.name); put("url", it.url) }) }
-            })
+        val dbFile = parent.findFile("distox14.sqlite") ?: return@withContext
+        
+        val tempDb = JFile(context.cacheDir, "save_settings_temp.sqlite")
+        context.contentResolver.openInputStream(dbFile.uri)?.use { input ->
+            FileOutputStream(tempDb).use { output -> input.copyTo(output) }
         }
-        context.contentResolver.openOutputStream(file.uri, "wt")?.use { it.write(json.toString(2).toByteArray()) }
-    } catch (e: Exception) { e.printStackTrace() }
+        
+        SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
+            ensureCaveArchiveColumn(db)
+            db.beginTransaction()
+            try {
+                db.delete("CA_Archives", null, null)
+                for (archive in archives) {
+                    val values = ContentValues().apply {
+                        put("name", archive.name)
+                        put("url", archive.url)
+                        if (archive.id > 0) put("id", archive.id)
+                    }
+                    db.insert("CA_Archives", null, values)
+                }
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+        }
+        
+        context.contentResolver.openOutputStream(dbFile.uri, "wt")?.use { output ->
+            tempDb.inputStream().use { input -> input.copyTo(output) }
+            output.flush()
+        }
+        tempDb.delete()
+    } catch (e: Exception) {
+        e.printStackTrace()
+    }
 }
 
 suspend fun wipeManagedData(
     context: Context,
     localFolderUri: Uri,
+    archiveId: Int? = null,
     onLog: (String, Color) -> Unit
 ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
     try {
@@ -696,45 +780,47 @@ suspend fun wipeManagedData(
                 FileOutputStream(tempDb).use { output -> input.copyTo(output) }
             }
 
-                            SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
+            SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
                 db.beginTransaction()
                 try {
                     ensureCaveArchiveColumn(db)
-                    val fixedDeleted = db.delete("fixeds", "caveArchive = 1", null)
-                    val shotsDeleted = db.delete("shots", "caveArchive = 1", null)
-                    val surveysDeleted = db.delete("surveys", "caveArchive = 1", null)
+                    val whereClause = if (archiveId == null) "caveArchive > 0" else "caveArchive = ?"
+                    val whereArgs = if (archiveId == null) null else arrayOf(archiveId.toString())
+
+                    val fixedDeleted = db.delete("fixeds", whereClause, whereArgs)
+                    val shotsDeleted = db.delete("shots", whereClause, whereArgs)
+                    val surveysDeleted = db.delete("surveys", whereClause, whereArgs)
+                    
+                    // Clear synched surveys metadata
+                    db.delete("CA_Surveys", if (archiveId == null) null else "archiveId = ?", whereArgs)
+                    
+                    // Delete physical supporting files before clearing the table
+                    val parent = DocumentFile.fromTreeUri(context, localFolderUri)
+                    var deletedFilesCount = 0
+                    db.query("CA_Files", arrayOf("path"), if (archiveId == null) null else "archiveId = ?", whereArgs, null, null, null).use { cursor ->
+                        while (cursor.moveToNext()) {
+                            val path = cursor.getString(0)
+                            val parts = path.split("/")
+                            if (parts.size == 2) {
+                                parent?.findFile(parts[0])?.findFile(parts[1])?.delete()
+                                deletedFilesCount++
+                            }
+                        }
+                    }
+                    db.delete("CA_Files", if (archiveId == null) null else "archiveId = ?", whereArgs)
+                    
                     db.setTransactionSuccessful()
                     
-        // Delete supporting files and inventory
-                    val parent = DocumentFile.fromTreeUri(context, localFolderUri)
-                    val archiveFolder = parent?.findFile("CaveArchive")
-                    val inventoryFile = archiveFolder?.findFile("CaveArchive_files.json")
-                    val synchedCavesFile = archiveFolder?.findFile("CaveArchive_synched_caves.json")
-                    
-                    if (inventoryFile != null) {
-                        try {
-                            val jsonStr = context.contentResolver.openInputStream(inventoryFile.uri)?.use { it.bufferedReader().readText() }
-                            if (!jsonStr.isNullOrBlank()) {
-                                val json = JSONObject(jsonStr)
-                                val array = json.getJSONArray("downloaded_files")
-                                var deletedFilesCount = 0
-                                for (i in 0 until array.length()) {
-                                    val item = array.get(i)
-                                    val path = if (item is JSONObject) item.getString("path") else item.toString()
-                                    val parts = path.split("/")
-                                    if (parts.size == 2) {
-                                        parent?.findFile(parts[0])?.findFile(parts[1])?.delete()
-                                        deletedFilesCount++
-                                    }
-                                }
-                                withContext(Dispatchers.Main) {
-                                    onLog("Deleted $deletedFilesCount supporting files.", Color.Yellow)
-                                }
-                            }
-                        } catch (e: Exception) { e.printStackTrace() }
-                        inventoryFile.delete()
+                    withContext(Dispatchers.Main) {
+                        onLog("Deleted $deletedFilesCount supporting files.", Color.Yellow)
                     }
-                    synchedCavesFile?.delete()
+
+                    // Delete OLD JSONs if they exist (only for full wipe)
+                    if (archiveId == null) {
+                        val archiveFolder = parent?.findFile("CaveArchive")
+                        archiveFolder?.findFile("CaveArchive_files.json")?.delete()
+                        archiveFolder?.findFile("CaveArchive_synched_caves.json")?.delete()
+                    }
 
                     withContext(Dispatchers.Main) {
                         onLog("Deleted $surveysDeleted surveys, $shotsDeleted shots and $fixedDeleted fixed points.", Color.Yellow)
@@ -762,48 +848,127 @@ fun getDisplayName(uri: Uri): String = uri.path?.split(":")?.lastOrNull() ?: uri
 fun ensureCaveArchiveColumn(db: SQLiteDatabase) {
     val tables = listOf("surveys", "shots", "fixeds")
     for (table in tables) {
-        val cursor = db.rawQuery("PRAGMA table_info($table)", null)
-        var exists = false
-        cursor.use {
-            while (it.moveToNext()) {
-                if (it.getString(it.getColumnIndexOrThrow("name")) == "caveArchive") {
-                    exists = true
-                    break
+        try {
+            val cursor = db.rawQuery("SELECT * FROM $table LIMIT 0", null)
+            val exists = cursor.getColumnIndex("caveArchive") != -1
+            cursor.close()
+            if (!exists) {
+                db.execSQL("ALTER TABLE $table ADD COLUMN caveArchive INTEGER DEFAULT 0")
+            }
+        } catch (e: Exception) {
+            // Table might not exist yet in TopoDroid DB if it's very old or corrupted
+        }
+    }
+    db.execSQL("CREATE TABLE IF NOT EXISTS CA_Archives (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT)")
+    db.execSQL("CREATE TABLE IF NOT EXISTS CA_Surveys (id INTEGER PRIMARY KEY AUTOINCREMENT, archiveId INTEGER, file_name TEXT, drive_id TEXT, modified_time TEXT)")
+    db.execSQL("CREATE TABLE IF NOT EXISTS CA_Files (id INTEGER PRIMARY KEY AUTOINCREMENT, archiveId INTEGER, path TEXT, drive_id TEXT, modified_time TEXT)")
+}
+
+suspend fun migrateJsonToDb(context: Context, folderUri: Uri) = withContext(Dispatchers.IO) {
+    try {
+        val parent = DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext
+        val archiveFolder = parent.findFile("CaveArchive") ?: return@withContext
+        val dbFile = parent.findFile("distox14.sqlite") ?: return@withContext
+
+        // Migrate Archives (Settings)
+        val settingsFile = archiveFolder.findFile("CaveArchive_Settings.json")
+        if (settingsFile != null) {
+            val current = loadSettings(context, folderUri)
+            if (current.isEmpty()) {
+                val jsonStr = context.contentResolver.openInputStream(settingsFile.uri)?.use { it.bufferedReader().readText() } ?: ""
+                val array = JSONObject(jsonStr).getJSONArray("archives")
+                val toMigrate = List(array.length()) { i ->
+                    val obj = array.getJSONObject(i)
+                    ArchiveConfig(name = obj.getString("name"), url = obj.getString("url"))
+                }
+                if (toMigrate.isNotEmpty()) {
+                    saveSettings(context, folderUri, toMigrate)
                 }
             }
         }
-        if (!exists) {
-            db.execSQL("ALTER TABLE $table ADD COLUMN caveArchive INTEGER DEFAULT 0")
+
+        // Migrate Files Inventory
+        val inventoryFile = archiveFolder.findFile("CaveArchive_files.json")
+        if (inventoryFile != null) {
+            val tempDb = JFile(context.cacheDir, "migrate_files_temp.sqlite")
+            context.contentResolver.openInputStream(dbFile.uri)?.use { input ->
+                FileOutputStream(tempDb).use { output -> input.copyTo(output) }
+            }
+
+            SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
+                ensureCaveArchiveColumn(db)
+                val count = db.rawQuery("SELECT COUNT(*) FROM CA_Files", null).use { if (it.moveToFirst()) it.getInt(0) else 0 }
+                if (count == 0) {
+                    val jsonStr = context.contentResolver.openInputStream(inventoryFile.uri)?.use { it.bufferedReader().readText() } ?: ""
+                    val array = JSONObject(jsonStr).getJSONArray("downloaded_files")
+                    val archives = loadSettings(context, folderUri)
+                    if (archives.isNotEmpty()) {
+                        val firstArchiveId = archives.first().id
+                        db.beginTransaction()
+                        try {
+                            for (i in 0 until array.length()) {
+                                val item = array.get(i)
+                                val obj = if (item is JSONObject) item else null
+                                if (obj != null) {
+                                    val values = ContentValues().apply {
+                                        put("archiveId", firstArchiveId)
+                                        put("path", obj.getString("path"))
+                                        put("drive_id", obj.getString("drive_id"))
+                                        put("modified_time", obj.getString("modified_time"))
+                                    }
+                                    db.insert("CA_Files", null, values)
+                                }
+                            }
+                            db.setTransactionSuccessful()
+                        } finally {
+                            db.endTransaction()
+                        }
+                    }
+                }
+            }
+            context.contentResolver.openOutputStream(dbFile.uri, "wt")?.use { output ->
+                tempDb.inputStream().use { input -> input.copyTo(output) }
+                output.flush()
+            }
+            tempDb.delete()
         }
-    }
+    } catch (e: Exception) { e.printStackTrace() }
 }
 
 suspend fun syncDriveFolderOAuth(
-    context: Context, urlString: String, localFolderUri: Uri, onLog: (String, Color) -> Unit, checkCancelled: () -> Boolean
+    context: Context, archive: ArchiveConfig, localFolderUri: Uri, onLog: (String, Color) -> Unit, checkCancelled: () -> Boolean
 ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
     suspend fun safeLog(text: String, color: Color = Color.White) = withContext(Dispatchers.Main) { onLog(text, color) }
     suspend fun <T> runWithRetry(name: String, block: () -> T): T {
         var lastEx: Throwable? = null
         for (i in 1..3) {
+            // Priority check for manual stop
             if (checkCancelled()) throw kotlinx.coroutines.CancellationException()
+            
             try {
-                return withTimeout(120000) {
+                return withTimeout(120000) { // 2 minutes timeout
                     kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
                         block()
                     }
                 }
             } catch (t: Throwable) {
+                // If user pressed Stop, stop immediately without retrying
                 if (t is kotlinx.coroutines.CancellationException && t !is kotlinx.coroutines.TimeoutCancellationException) {
                     throw t
                 }
+                
                 lastEx = t
                 if (i < 3) {
-                    safeLog("Retry $i: $name", Color.Yellow)
+                    val errorDetail = t.localizedMessage ?: "Timeout or Network error"
+                    safeLog("Retry $i/3: $name ($errorDetail)", Color.Yellow)
+                    // Wait before next attempt, but check for cancellation during delay
                     delay(2000)
+                } else {
+                    safeLog("Failed after 3 attempts: $name", Color.Red)
                 }
             }
         }
-        throw lastEx ?: Exception("Timeout $name")
+        throw lastEx ?: Exception("Task $name failed after multiple attempts")
     }
 
     try {
@@ -811,8 +976,8 @@ suspend fun syncDriveFolderOAuth(
         val credential = GoogleAccountCredential.usingOAuth2(context, Collections.singleton(DriveScopes.DRIVE_READONLY)).apply { selectedAccount = account.account }
         val drive = Drive.Builder(AndroidHttp.newCompatibleTransport(), GsonFactory.getDefaultInstance(), credential).setApplicationName("CaveArchive").build()
 
-        val folderId = if (urlString.contains("/folders/")) urlString.split("/folders/").getOrNull(1)?.split("?")?.getOrNull(0)
-                       else if (urlString.contains("id=")) urlString.split("id=").getOrNull(1)?.split("&")?.getOrNull(0)
+        val folderId = if (archive.url.contains("/folders/")) archive.url.split("/folders/").getOrNull(1)?.split("?")?.getOrNull(0)
+                       else if (archive.url.contains("id=")) archive.url.split("id=").getOrNull(1)?.split("&")?.getOrNull(0)
                        else null
 
         if (folderId == null) return@withContext false to "Invalid URL"
@@ -824,37 +989,32 @@ suspend fun syncDriveFolderOAuth(
         val parentFolder = DocumentFile.fromTreeUri(context, localFolderUri) ?: return@withContext false to "Local folder error"
         val dbDocFile = parentFolder.findFile("distox14.sqlite")
 
-        val synchedCavesList = mutableListOf<JSONObject>()
         var updatedCavesCount = 0
         
-        // Load existing synched caves and files inventory
-        val existingSynchedCaves = mutableMapOf<String, JSONObject>()
+        // Load existing files inventory metadata
         val existingFilesMetadata = mutableMapOf<String, JSONObject>()
-        try {
-            val archiveFolder = parentFolder.findFile("CaveArchive")
-            
-            archiveFolder?.findFile("CaveArchive_synched_caves.json")?.let { file ->
-                val jsonStr = context.contentResolver.openInputStream(file.uri)?.use { it.bufferedReader().readText() } ?: ""
-                if (jsonStr.isNotBlank()) {
-                    val array = JSONObject(jsonStr).getJSONArray("synched_caves")
-                    for (i in 0 until array.length()) {
-                        val obj = array.getJSONObject(i)
-                        existingSynchedCaves[obj.getString("file_name")] = obj
+        if (dbDocFile != null) {
+            try {
+                val tempDb = JFile(context.cacheDir, "metadata_temp.sqlite")
+                context.contentResolver.openInputStream(dbDocFile.uri)?.use { input ->
+                    FileOutputStream(tempDb).use { output -> input.copyTo(output) }
+                }
+                SQLiteDatabase.openDatabase(tempDb.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { db ->
+                    ensureCaveArchiveColumn(db)
+                    db.query("CA_Files", null, "archiveId = ?", arrayOf(archive.id.toString()), null, null, null).use { cursor ->
+                        while (cursor.moveToNext()) {
+                            val path = cursor.getString(cursor.getColumnIndexOrThrow("path"))
+                            existingFilesMetadata[path] = JSONObject().apply {
+                                put("path", path)
+                                put("drive_id", cursor.getString(cursor.getColumnIndexOrThrow("drive_id")))
+                                put("modified_time", cursor.getString(cursor.getColumnIndexOrThrow("modified_time")))
+                            }
+                        }
                     }
                 }
-            }
-            
-            archiveFolder?.findFile("CaveArchive_files.json")?.let { file ->
-                val jsonStr = context.contentResolver.openInputStream(file.uri)?.use { it.bufferedReader().readText() } ?: ""
-                if (jsonStr.isNotBlank()) {
-                    val array = JSONObject(jsonStr).getJSONArray("downloaded_files")
-                    for (i in 0 until array.length()) {
-                        val obj = array.optJSONObject(i)
-                        if (obj != null) existingFilesMetadata[obj.getString("path")] = obj
-                    }
-                }
-            }
-        } catch (e: Exception) { e.printStackTrace() }
+                tempDb.delete()
+            } catch (e: Exception) { e.printStackTrace() }
+        }
 
         if (dbDocFile != null) {
             val suffix = System.currentTimeMillis()
@@ -867,6 +1027,19 @@ suspend fun syncDriveFolderOAuth(
 
                 SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
                     ensureCaveArchiveColumn(db)
+                    
+                    // Load existing metadata from CA_Surveys
+                    val existingSynchedCaves = mutableMapOf<String, JSONObject>()
+                    db.query("CA_Surveys", null, "archiveId = ?", arrayOf(archive.id.toString()), null, null, null).use { cursor ->
+                        while (cursor.moveToNext()) {
+                            val fileName = cursor.getString(cursor.getColumnIndexOrThrow("file_name"))
+                            existingSynchedCaves[fileName] = JSONObject().apply {
+                                put("drive_id", cursor.getString(cursor.getColumnIndexOrThrow("drive_id")))
+                                put("modified_time", cursor.getString(cursor.getColumnIndexOrThrow("modified_time")))
+                            }
+                        }
+                    }
+
                     db.beginTransaction()
                     try {
                         for (i in 0 until caves.length()) {
@@ -876,7 +1049,7 @@ suspend fun syncDriveFolderOAuth(
                             val vals = ContentValues().apply {
                                 put("name", name); put("day", cave.optString("day", "")); put("team", cave.optString("team", ""))
                                 put("comment", cave.optString("comment", ""))
-                                put("caveArchive", 1)
+                                put("caveArchive", archive.id)
                                 put("declination", cave.optDouble("declination", 0.0))
                                 put("init_station", cave.optString("init_station", "")); put("xsections", 0); put("datamode", 0)
                                 put("extend", 0); put("created", 0); put("immutable", 0)
@@ -899,7 +1072,7 @@ suspend fun syncDriveFolderOAuth(
                                     put("altitude", f.optDouble("altitude", 0.0))
                                     put("altimetric", alt)
                                     put("comment", "")
-                                    put("caveArchive", 1)
+                                    put("caveArchive", archive.id)
                                     put("status", 0)
                                     put("cs_name", "")
                                     put("cs_longitude", 0.0)
@@ -932,17 +1105,24 @@ suspend fun syncDriveFolderOAuth(
 
                                     if (!needsUpdate && existingInfo != null) {
                                         safeLog("$sName is up to date, skipping measurements.", Color.Gray)
-                                        synchedCavesList.add(existingInfo)
                                     } else {
                                         val tShots = JFile(context.cacheDir, "temp_shots_$suffix.sqlite")
                                         runWithRetry("download $sName") { drive.files().get(sFile.id).executeMediaAsInputStream().use { inp -> FileOutputStream(tShots).use { inp.copyTo(it) } } }
                                         
-                                        // Track synched cave info
-                                        synchedCavesList.add(JSONObject().apply {
+                                        // Update metadata in DB
+                                        val metaVals = ContentValues().apply {
+                                            put("archiveId", archive.id)
                                             put("file_name", sName)
                                             put("drive_id", sFile.id)
                                             put("modified_time", currentModifiedTime)
-                                        })
+                                        }
+                                        val existingIdCursor = db.query("CA_Surveys", arrayOf("id"), "archiveId = ? AND file_name = ?", arrayOf(archive.id.toString(), sName), null, null, null)
+                                        if (existingIdCursor.moveToFirst()) {
+                                            db.update("CA_Surveys", metaVals, "id = ?", arrayOf(existingIdCursor.getInt(0).toString()))
+                                        } else {
+                                            db.insert("CA_Surveys", null, metaVals)
+                                        }
+                                        existingIdCursor.close()
 
                                         SQLiteDatabase.openDatabase(tShots.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { sDb ->
                                             db.delete("shots", "surveyId = ?", arrayOf(sId.toString()))
@@ -958,7 +1138,7 @@ suspend fun syncDriveFolderOAuth(
                                                             Cursor.FIELD_TYPE_BLOB -> row.put(col, sc.getBlob(idx))
                                                         }
                                                     }
-                                                    row.put("caveArchive", 1)
+                                                    row.put("caveArchive", archive.id)
                                                     row.put("surveyId", sId)
                                                     db.insertWithOnConflict("shots", null, row, SQLiteDatabase.CONFLICT_REPLACE)
                                                 } while (sc.moveToNext())
@@ -980,12 +1160,6 @@ suspend fun syncDriveFolderOAuth(
                             tempDb.inputStream().use { input -> input.copyTo(out) }
                             out.flush() 
                         }
-                        
-                        // Save synched caves inventory
-                        if (synchedCavesList.isNotEmpty()) {
-                            updateSynchedCavesInventory(context, localFolderUri, synchedCavesList)
-                        }
-
                         safeLog("Database updated: $updatedCavesCount sqlite files processed.", Color.Green)
                     }
                 }
@@ -1037,7 +1211,7 @@ suspend fun syncDriveFolderOAuth(
         }
         
         if (downloadedPathsMetadata.isNotEmpty()) {
-            updateFilesInventory(context, localFolderUri, downloadedPathsMetadata)
+            updateFilesInventory(context, localFolderUri, archive.id, downloadedPathsMetadata)
         }
 
         return@withContext true to (if (checkCancelled()) "Interrupted." else "Files updated: $dlCount files downloaded.")
@@ -1046,59 +1220,48 @@ suspend fun syncDriveFolderOAuth(
 
 private fun cursorToFirst(c: Cursor?): Boolean = c?.moveToFirst() ?: false
 
-suspend fun updateFilesInventory(context: Context, folderUri: Uri, newItems: List<JSONObject>) = withContext(Dispatchers.IO) {
+suspend fun updateFilesInventory(context: Context, folderUri: Uri, archiveId: Int, newItems: List<JSONObject>) = withContext(Dispatchers.IO) {
     try {
         val parent = DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext
-        val folder = parent.findFile("CaveArchive") ?: parent.createDirectory("CaveArchive") ?: return@withContext
-        val file = folder.findFile("CaveArchive_files.json") ?: folder.createFile("application/json", "CaveArchive_files.json") ?: return@withContext
-        
-        val existingContent = context.contentResolver.openInputStream(file.uri)?.use { it.bufferedReader().readText() } ?: ""
-        val json = if (existingContent.isNotBlank()) JSONObject(existingContent) else JSONObject().apply { put("downloaded_files", JSONArray()) }
-        val array = json.getJSONArray("downloaded_files")
-        
-        newItems.forEach { newItem ->
-            val path = newItem.getString("path")
-            var found = false
-            for (i in 0 until array.length()) {
-                val existing = array.optJSONObject(i)
-                if (existing != null && existing.getString("path") == path) {
-                    array.put(i, newItem)
-                    found = true
-                    break
-                }
-            }
-            if (!found) array.put(newItem)
-        }
-        
-        context.contentResolver.openOutputStream(file.uri, "wt")?.use { it.write(json.toString(2).toByteArray()) }
-    } catch (e: Exception) { e.printStackTrace() }
-}
+        val dbDocFile = parent.findFile("distox14.sqlite") ?: return@withContext
 
-suspend fun updateSynchedCavesInventory(context: Context, folderUri: Uri, newItems: List<JSONObject>) = withContext(Dispatchers.IO) {
-    try {
-        val parent = DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext
-        val folder = parent.findFile("CaveArchive") ?: parent.createDirectory("CaveArchive") ?: return@withContext
-        val file = folder.findFile("CaveArchive_synched_caves.json") ?: folder.createFile("application/json", "CaveArchive_synched_caves.json") ?: return@withContext
-
-        val existingContent = context.contentResolver.openInputStream(file.uri)?.use { it.bufferedReader().readText() } ?: ""
-        val json = if (existingContent.isNotBlank()) JSONObject(existingContent) else JSONObject().apply { put("synched_caves", JSONArray()) }
-        val array = json.getJSONArray("synched_caves")
-        
-        // Aggiorna o aggiungi nuovi item
-        newItems.forEach { newItem ->
-            val fileName = newItem.getString("file_name")
-            var found = false
-            for (i in 0 until array.length()) {
-                if (array.getJSONObject(i).getString("file_name") == fileName) {
-                    array.put(i, newItem)
-                    found = true
-                    break
-                }
-            }
-            if (!found) array.put(newItem)
+        val tempDb = JFile(context.cacheDir, "update_files_temp.sqlite")
+        context.contentResolver.openInputStream(dbDocFile.uri)?.use { input ->
+            FileOutputStream(tempDb).use { output -> input.copyTo(output) }
         }
 
-        context.contentResolver.openOutputStream(file.uri, "wt")?.use { it.write(json.toString(2).toByteArray()) }
+        SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
+            ensureCaveArchiveColumn(db)
+            db.beginTransaction()
+            try {
+                newItems.forEach { newItem ->
+                    val path = newItem.getString("path")
+                    val vals = ContentValues().apply {
+                        put("archiveId", archiveId)
+                        put("path", path)
+                        put("drive_id", newItem.getString("drive_id"))
+                        put("modified_time", newItem.getString("modified_time"))
+                    }
+                    
+                    val existingIdCursor = db.query("CA_Files", arrayOf("id"), "archiveId = ? AND path = ?", arrayOf(archiveId.toString(), path), null, null, null)
+                    if (existingIdCursor.moveToFirst()) {
+                        db.update("CA_Files", vals, "id = ?", arrayOf(existingIdCursor.getInt(0).toString()))
+                    } else {
+                        db.insert("CA_Files", null, vals)
+                    }
+                    existingIdCursor.close()
+                }
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+        }
+
+        context.contentResolver.openOutputStream(dbDocFile.uri, "wt")?.use { output ->
+            tempDb.inputStream().use { input -> input.copyTo(output) }
+            output.flush()
+        }
+        tempDb.delete()
     } catch (e: Exception) { e.printStackTrace() }
 }
 
