@@ -1,4 +1,4 @@
-package com.example.cavearchive.ui.theme
+package com.cavearchive.app.ui.theme
 
 import androidx.compose.ui.graphics.Color
 

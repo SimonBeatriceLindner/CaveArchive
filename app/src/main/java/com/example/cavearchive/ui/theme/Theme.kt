@@ -1,4 +1,4 @@
-package com.example.cavearchive.ui.theme
+package com.cavearchive.app.ui.theme
 
 import android.app.Activity
 import android.os.Build

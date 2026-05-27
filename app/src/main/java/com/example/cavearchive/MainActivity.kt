@@ -1,4 +1,4 @@
-package com.example.cavearchive
+package com.cavearchive.app
 
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -86,7 +86,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.edit
 import androidx.core.net.toUri
 import androidx.documentfile.provider.DocumentFile
-import com.example.cavearchive.ui.theme.CaveArchiveTheme
+import com.cavearchive.app.ui.theme.CaveArchiveTheme
 import com.google.android.gms.auth.api.signin.GoogleSignIn
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions
 import com.google.android.gms.common.api.Scope
@@ -163,6 +163,7 @@ fun MainScreen() {
     var isCancelled by remember { mutableStateOf(false) }
     var syncJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     var isSignedIn by remember { mutableStateOf(GoogleSignIn.getLastSignedInAccount(context) != null) }
+    var isDbFound by remember { mutableStateOf(false) }
 
     val logs = remember { mutableStateListOf<LogMessage>() }
     val listState = rememberLazyListState()
@@ -205,13 +206,36 @@ fun MainScreen() {
     LaunchedEffect(selectedFolderUri) {
         selectedFolderUri?.let { uri ->
             scope.launch {
-                migrateJsonToDb(context, uri)
-                archives = emptyList()
-                val loaded = loadSettings(context, uri)
-                archives = loaded
-                val lastUrl = sharedPrefs.getString(KEY_ARCHIVE_URL, "")
-                selectedArchive = loaded.find { it.url == lastUrl } ?: loaded.firstOrNull()
+                val parent = DocumentFile.fromTreeUri(context, uri)
+                isDbFound = parent?.findFile("distox14.sqlite") != null
+                
+                if (isDbFound) {
+                    migrateJsonToDb(context, uri)
+                    archives = emptyList()
+                    val loaded = loadSettings(context, uri)
+                    archives = loaded
+                    val lastUrl = sharedPrefs.getString(KEY_ARCHIVE_URL, "")
+                    selectedArchive = loaded.find { it.url == lastUrl } ?: loaded.firstOrNull()
+                    
+                    if (selectedArchive == null || selectedArchive?.url?.isBlank() == true) {
+                        addLog("Sync disabled: Please configure an Archive URL in settings.", Color.Yellow)
+                    }
+                } else {
+                    archives = emptyList()
+                    selectedArchive = null
+                    addLog("Sync disabled: distox14.sqlite not found in selected folder!", Color.Red)
+                }
             }
+        } ?: run {
+            isDbFound = false
+            addLog("Sync disabled: Storage folder not selected.", Color.Yellow)
+        }
+    }
+
+    // Monitora la selezione dell'archivio
+    LaunchedEffect(selectedArchive) {
+        if (isDbFound && (selectedArchive == null || selectedArchive?.url?.isBlank() == true)) {
+            addLog("Sync disabled: No valid archive selected.", Color.Yellow)
         }
     }
 
@@ -489,6 +513,7 @@ fun MainScreen() {
                                     }
                                 }
                             },
+                            enabled = isDbFound && selectedArchive != null && selectedArchive?.url?.isNotBlank() == true,
                             modifier = Modifier.height(56.dp).fillMaxWidth(0.6f)
                         ) { Text("Sync", style = MaterialTheme.typography.titleLarge) }
                     }

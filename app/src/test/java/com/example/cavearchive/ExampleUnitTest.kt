@@ -1,4 +1,4 @@
-package com.example.cavearchive
+package com.cavearchive.app
 
 import org.junit.Test
 
