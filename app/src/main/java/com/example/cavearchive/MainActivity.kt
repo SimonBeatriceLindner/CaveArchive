@@ -53,11 +53,15 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -115,6 +119,7 @@ import java.io.File as JFile
 
 data class LogMessage(val text: String, val color: Color, val time: String)
 data class ArchiveConfig(val id: Int = 0, val name: String, val url: String)
+data class SurveyInfo(val id: Int, val name: String)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -146,6 +151,7 @@ fun MainScreen() {
     var archiveToWipe by remember { mutableStateOf<ArchiveConfig?>(null) }
     var showMenu by remember { mutableStateOf(false) }
     var showManageArchivesDialog by remember { mutableStateOf(false) }
+    var showUploadDialog by remember { mutableStateOf(false) }
 
     var archives by remember { mutableStateOf(emptyList<ArchiveConfig>()) }
     var selectedArchive by remember { mutableStateOf<ArchiveConfig?>(null) }
@@ -415,6 +421,16 @@ fun MainScreen() {
         )
     }
 
+    if (showUploadDialog) {
+        UploadDialog(
+            context = context,
+            localFolderUri = selectedFolderUri,
+            selectedArchive = selectedArchive,
+            onDismiss = { showUploadDialog = false },
+            onLog = { t, c -> addLog(t, c) }
+        )
+    }
+
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         topBar = {
@@ -431,6 +447,10 @@ fun MainScreen() {
                         Icon(Icons.Default.MoreVert, contentDescription = null)
                     }
                     DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Upload") },
+                            onClick = { showMenu = false; showUploadDialog = true }
+                        )
                         DropdownMenuItem(
                             text = { Text("Logout") },
                             onClick = {
@@ -461,7 +481,7 @@ fun MainScreen() {
         ) {
             Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(
-                    text = "Synchronize TopoDroid surveys from Google Drive",
+                    text = "Synchronize TopoDroid surveys/to Google Drive",
                     style = MaterialTheme.typography.bodyLarge,
                     textAlign = TextAlign.Center
                 )
@@ -485,7 +505,11 @@ fun MainScreen() {
                     if (!isSignedIn) {
                         Button(onClick = {
                             val gso = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
-                                .requestEmail().requestScopes(Scope(DriveScopes.DRIVE_READONLY)).build()
+                                .requestEmail()
+                                .requestScopes(
+                                    Scope(DriveScopes.DRIVE_READONLY),
+                                    Scope(DriveScopes.DRIVE_FILE)
+                                ).build()
                             signInLauncher.launch(GoogleSignIn.getClient(context, gso).signInIntent)
                         }) { Text("Google Login") }
                     } else {
@@ -717,6 +741,633 @@ fun ManageArchivesDialog(
                 }) { Text("OK") }
             }
         )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun UploadDialog(
+    context: Context,
+    localFolderUri: Uri?,
+    selectedArchive: ArchiveConfig?,
+    onDismiss: () -> Unit,
+    onLog: (String, Color) -> Unit
+) {
+    var surveys by remember { mutableStateOf(emptyList<SurveyInfo>()) }
+    var selectedSurvey by remember { mutableStateOf<SurveyInfo?>(null) }
+    var newName by remember { mutableStateOf("") }
+    
+    var isBranchMode by remember { mutableStateOf(false) }
+    var selectedFirstStation by remember { mutableStateOf("") }
+    var selectedSurveyToConnect by remember { mutableStateOf<SurveyInfo?>(null) }
+    var selectedSecondStation by remember { mutableStateOf("") }
+    
+    var firstSurveyStations by remember { mutableStateOf(emptyList<String>()) }
+    var secondSurveyStations by remember { mutableStateOf(emptyList<String>()) }
+    var archiveSurveys by remember { mutableStateOf(emptyList<SurveyInfo>()) }
+    
+    var firstStationSearch by remember { mutableStateOf("") }
+    var secondStationSearch by remember { mutableStateOf("") }
+    
+    val filteredFirstStations = remember(firstSurveyStations, firstStationSearch) {
+        if (firstStationSearch.isEmpty()) firstSurveyStations.take(50)
+        else firstSurveyStations.filter { it.contains(firstStationSearch, ignoreCase = true) }.take(50)
+    }
+    
+    val filteredSecondStations = remember(secondSurveyStations, secondStationSearch) {
+        if (secondStationSearch.isEmpty()) secondSurveyStations.take(50)
+        else secondSurveyStations.filter { it.contains(secondStationSearch, ignoreCase = true) }.take(50)
+    }
+
+    var expandedSurvey by remember { mutableStateOf(false) }
+    var expandedFirstStation by remember { mutableStateOf(false) }
+    var expandedSurveyToConnect by remember { mutableStateOf(false) }
+    var expandedSecondStation by remember { mutableStateOf(false) }
+    
+    var isUploading by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        localFolderUri?.let { uri ->
+            surveys = loadSurveysFromDb(context, uri)
+            selectedSurvey = surveys.firstOrNull()
+            newName = selectedSurvey?.name ?: ""
+        }
+    }
+
+    LaunchedEffect(selectedArchive) {
+        selectedArchive?.let { arch ->
+            localFolderUri?.let { uri ->
+                archiveSurveys = loadArchiveSurveysFromDb(context, uri, arch.id)
+            }
+        }
+    }
+
+    LaunchedEffect(selectedSurvey) {
+        selectedSurvey?.let { s ->
+            localFolderUri?.let { uri ->
+                firstSurveyStations = loadStationsFromDb(context, uri, s.id)
+                selectedFirstStation = firstSurveyStations.firstOrNull() ?: ""
+                firstStationSearch = selectedFirstStation
+            }
+        }
+    }
+
+    LaunchedEffect(selectedSurveyToConnect) {
+        selectedSurveyToConnect?.let { s ->
+            localFolderUri?.let { uri ->
+                secondSurveyStations = loadStationsFromDb(context, uri, s.id)
+                selectedSecondStation = secondSurveyStations.firstOrNull() ?: ""
+                secondStationSearch = selectedSecondStation
+            }
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Upload Survey") },
+        text = {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                item {
+                    Text("Select Survey:", style = MaterialTheme.typography.labelLarge)
+                    ExposedDropdownMenuBox(
+                        expanded = expandedSurvey,
+                        onExpandedChange = { expandedSurvey = it }
+                    ) {
+                        OutlinedTextField(
+                            value = selectedSurvey?.name ?: "",
+                            onValueChange = {},
+                            readOnly = true,
+                            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedSurvey) },
+                            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable).fillMaxWidth()
+                        )
+                        ExposedDropdownMenu(
+                            expanded = expandedSurvey,
+                            onDismissRequest = { expandedSurvey = false }
+                        ) {
+                            surveys.forEach { survey ->
+                                DropdownMenuItem(
+                                    text = { Text(survey.name) },
+                                    onClick = {
+                                        selectedSurvey = survey
+                                        newName = survey.name
+                                        expandedSurvey = false
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+
+                item {
+                    OutlinedTextField(
+                        value = newName,
+                        onValueChange = { newName = it },
+                        label = { Text("New name") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                item {
+                    Column {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            RadioButton(
+                                selected = !isBranchMode,
+                                onClick = { isBranchMode = false }
+                            )
+                            Text(
+                                "Upload geopoint",
+                                modifier = Modifier.clickable { isBranchMode = false }
+                            )
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            RadioButton(
+                                selected = isBranchMode,
+                                onClick = { isBranchMode = true }
+                            )
+                            Text(
+                                "Join branch",
+                                modifier = Modifier.clickable { isBranchMode = true }
+                            )
+                        }
+                    }
+                }
+
+                if (isBranchMode) {
+                    item {
+                        Text("First junction point:", style = MaterialTheme.typography.labelLarge)
+                        ExposedDropdownMenuBox(
+                            expanded = expandedFirstStation,
+                            onExpandedChange = { expandedFirstStation = it }
+                        ) {
+                            OutlinedTextField(
+                                value = firstStationSearch,
+                                onValueChange = { 
+                                    firstStationSearch = it
+                                    selectedFirstStation = it
+                                    expandedFirstStation = true
+                                },
+                                label = { Text("Search station") },
+                                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedFirstStation) },
+                                modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryEditable).fillMaxWidth()
+                            )
+                            ExposedDropdownMenu(
+                                expanded = expandedFirstStation,
+                                onDismissRequest = { expandedFirstStation = false }
+                            ) {
+                                filteredFirstStations.forEach { station ->
+                                    DropdownMenuItem(
+                                        text = { Text(station) },
+                                        onClick = {
+                                            selectedFirstStation = station
+                                            firstStationSearch = station
+                                            expandedFirstStation = false
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    item {
+                        Text("Survey to connect:", style = MaterialTheme.typography.labelLarge)
+                        ExposedDropdownMenuBox(
+                            expanded = expandedSurveyToConnect,
+                            onExpandedChange = { expandedSurveyToConnect = it }
+                        ) {
+                            OutlinedTextField(
+                                value = selectedSurveyToConnect?.name ?: "",
+                                onValueChange = {},
+                                readOnly = true,
+                                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedSurveyToConnect) },
+                                modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable).fillMaxWidth()
+                            )
+                            ExposedDropdownMenu(
+                                expanded = expandedSurveyToConnect,
+                                onDismissRequest = { expandedSurveyToConnect = false }
+                            ) {
+                                archiveSurveys.forEach { survey ->
+                                    DropdownMenuItem(
+                                        text = { Text(survey.name) },
+                                        onClick = {
+                                            selectedSurveyToConnect = survey
+                                            expandedSurveyToConnect = false
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    if (selectedSurveyToConnect != null) {
+                        item {
+                            Text("Second junction point:", style = MaterialTheme.typography.labelLarge)
+                            ExposedDropdownMenuBox(
+                                expanded = expandedSecondStation,
+                                onExpandedChange = { expandedSecondStation = it }
+                            ) {
+                                OutlinedTextField(
+                                    value = secondStationSearch,
+                                    onValueChange = { 
+                                        secondStationSearch = it
+                                        selectedSecondStation = it
+                                        expandedSecondStation = true
+                                    },
+                                    label = { Text("Search station") },
+                                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedSecondStation) },
+                                    modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryEditable).fillMaxWidth()
+                                )
+                                ExposedDropdownMenu(
+                                    expanded = expandedSecondStation,
+                                    onDismissRequest = { expandedSecondStation = false }
+                                ) {
+                                    filteredSecondStations.forEach { station ->
+                                        DropdownMenuItem(
+                                            text = { Text(station) },
+                                            onClick = {
+                                                selectedSecondStation = station
+                                                secondStationSearch = station
+                                                expandedSecondStation = false
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val survey = selectedSurvey
+                    if (survey != null && newName.isNotBlank() && selectedArchive != null && localFolderUri != null) {
+                        isUploading = true
+                        scope.launch {
+                            val junctionData = if (isBranchMode && selectedFirstStation.isNotBlank() && selectedSurveyToConnect != null && selectedSecondStation.isNotBlank()) {
+                                JunctionData(selectedFirstStation, selectedSurveyToConnect!!.name, selectedSecondStation)
+                            } else null
+                            uploadSurveyToDrive(context, selectedArchive, localFolderUri, survey, newName, !isBranchMode, junctionData, onLog)
+                            onDismiss()
+                        }
+                    }
+                },
+                enabled = !isUploading && selectedSurvey != null && newName.isNotBlank()
+            ) {
+                if (isUploading) CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                else Text("Upload")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !isUploading) { Text("Cancel") }
+        }
+    )
+}
+
+data class JunctionData(val firstStation: String, val otherSurveyName: String, val secondStation: String)
+
+suspend fun loadStationsFromDb(context: Context, folderUri: Uri, surveyId: Int): List<String> = withContext(Dispatchers.IO) {
+    val stations = mutableSetOf<String>()
+    try {
+        val parent = DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext emptyList()
+        val dbFile = parent.findFile("distox14.sqlite") ?: return@withContext emptyList()
+        val tempDb = JFile(context.cacheDir, "temp_load_stations.sqlite")
+        context.contentResolver.openInputStream(dbFile.uri)?.use { input ->
+            FileOutputStream(tempDb).use { output -> input.copyTo(output) }
+        }
+        SQLiteDatabase.openDatabase(tempDb.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { db ->
+            db.query("shots", arrayOf("fStation", "tStation"), "surveyId = ?", arrayOf(surveyId.toString()), null, null, null).use { cursor ->
+                while (cursor.moveToNext()) {
+                    val f = cursor.getString(0)
+                    val t = cursor.getString(1)
+                    if (!f.isNullOrBlank()) stations.add(f)
+                    if (!t.isNullOrBlank()) stations.add(t)
+                }
+            }
+        }
+        tempDb.delete()
+    } catch (e: Exception) { e.printStackTrace() }
+    stations.toList().sorted()
+}
+
+suspend fun loadArchiveSurveysFromDb(context: Context, folderUri: Uri, archiveId: Int): List<SurveyInfo> = withContext(Dispatchers.IO) {
+    val list = mutableListOf<SurveyInfo>()
+    try {
+        val parent = DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext emptyList()
+        val dbFile = parent.findFile("distox14.sqlite") ?: return@withContext emptyList()
+        val tempDb = JFile(context.cacheDir, "temp_load_arch_surveys.sqlite")
+        context.contentResolver.openInputStream(dbFile.uri)?.use { input ->
+            FileOutputStream(tempDb).use { output -> input.copyTo(output) }
+        }
+        SQLiteDatabase.openDatabase(tempDb.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { db ->
+            // Query the main 'surveys' table directly using the 'caveArchive' column
+            db.query("surveys", arrayOf("id", "name"), "caveArchive = ?", arrayOf(archiveId.toString()), null, null, "name ASC").use { cursor ->
+                while (cursor.moveToNext()) {
+                    list.add(SurveyInfo(cursor.getInt(0), cursor.getString(1)))
+                }
+            }
+        }
+        tempDb.delete()
+    } catch (e: Exception) { e.printStackTrace() }
+    list
+}
+
+suspend fun loadSurveysFromDb(context: Context, folderUri: Uri): List<SurveyInfo> = withContext(Dispatchers.IO) {
+    val list = mutableListOf<SurveyInfo>()
+    try {
+        val parent = DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext emptyList()
+        val dbFile = parent.findFile("distox14.sqlite") ?: return@withContext emptyList()
+        val tempDb = JFile(context.cacheDir, "temp_load_surveys.sqlite")
+        context.contentResolver.openInputStream(dbFile.uri)?.use { input ->
+            FileOutputStream(tempDb).use { output -> input.copyTo(output) }
+        }
+        SQLiteDatabase.openDatabase(tempDb.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { db ->
+            db.query("surveys", arrayOf("id", "name"), null, null, null, null, "name ASC").use { cursor ->
+                while (cursor.moveToNext()) {
+                    list.add(SurveyInfo(cursor.getInt(0), cursor.getString(1)))
+                }
+            }
+        }
+        tempDb.delete()
+    } catch (e: Exception) { e.printStackTrace() }
+    list
+}
+
+suspend fun uploadSurveyToDrive(
+    context: Context,
+    archive: ArchiveConfig,
+    localFolderUri: Uri,
+    survey: SurveyInfo,
+    newName: String,
+    uploadGeopoint: Boolean,
+    junctionData: JunctionData?,
+    onLog: (String, Color) -> Unit
+) = withContext(Dispatchers.IO) {
+    try {
+        withContext(Dispatchers.Main) { onLog("Starting upload: $newName", Color.Cyan) }
+        val account = GoogleSignIn.getLastSignedInAccount(context) ?: return@withContext
+        val credential = GoogleAccountCredential.usingOAuth2(context, Collections.singleton(DriveScopes.DRIVE_FILE)).apply { selectedAccount = account.account }
+        val drive = Drive.Builder(AndroidHttp.newCompatibleTransport(), GsonFactory.getDefaultInstance(), credential).setApplicationName("CaveArchive").build()
+
+        val folderId = if (archive.url.contains("/folders/")) archive.url.split("/folders/").getOrNull(1)?.split("?")?.getOrNull(0)
+                       else if (archive.url.contains("id=")) archive.url.split("id=").getOrNull(1)?.split("&")?.getOrNull(0)
+                       else null ?: return@withContext
+
+        val parent = DocumentFile.fromTreeUri(context, localFolderUri) ?: return@withContext
+        val dbDocFile = parent.findFile("distox14.sqlite") ?: return@withContext
+        
+        val tempSrcDb = JFile(context.cacheDir, "temp_src_upload.sqlite")
+        context.contentResolver.openInputStream(dbDocFile.uri)?.use { input ->
+            FileOutputStream(tempSrcDb).use { output -> input.copyTo(output) }
+        }
+
+        val uploadSqliteFile = JFile(context.cacheDir, "$newName.sqlite")
+        if (uploadSqliteFile.exists()) uploadSqliteFile.delete()
+        var surveyDataJson = JSONObject()
+        
+        SQLiteDatabase.openDatabase(tempSrcDb.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { srcDb ->
+            // 0. Trova l'ID reale della survey nel DB (nel caso fosse cambiato o diverso)
+            var realSurveyId = survey.id
+            srcDb.query("surveys", arrayOf("id"), "name = ?", arrayOf(survey.name), null, null, null).use { c ->
+                if (c.moveToFirst()) realSurveyId = c.getInt(0)
+            }
+            withContext(Dispatchers.Main) { onLog("Processing Survey ID: $realSurveyId (${survey.name})", Color.Gray) }
+
+            // 1. Leggi dati survey
+            srcDb.query("surveys", null, "id = ?", arrayOf(realSurveyId.toString()), null, null, null).use { sc ->
+                if (sc.moveToFirst()) {
+                    surveyDataJson.put("name", newName)
+                    surveyDataJson.put("day", sc.getString(sc.getColumnIndexOrThrow("day")))
+                    surveyDataJson.put("team", sc.getString(sc.getColumnIndexOrThrow("team")))
+                    surveyDataJson.put("comment", sc.getString(sc.getColumnIndexOrThrow("comment")))
+                    surveyDataJson.put("declination", sc.getString(sc.getColumnIndexOrThrow("declination")))
+                    surveyDataJson.put("init_station", sc.getString(sc.getColumnIndexOrThrow("init_station")))
+                    surveyDataJson.put("shotsFile", "$newName.sqlite")
+                }
+            }
+
+            // 2. Leggi fixeds
+            if (uploadGeopoint) {
+                srcDb.query("fixeds", null, "surveyId = ?", arrayOf(realSurveyId.toString()), null, null, null).use { fc ->
+                    if (fc.moveToFirst()) {
+                        val fixedsObj = JSONObject()
+                        fixedsObj.put("station", fc.getString(fc.getColumnIndexOrThrow("station")))
+                        fixedsObj.put("longitude", fc.getDouble(fc.getColumnIndexOrThrow("longitude")))
+                        fixedsObj.put("latitude", fc.getDouble(fc.getColumnIndexOrThrow("latitude")))
+                        fixedsObj.put("altimetric", fc.getDouble(fc.getColumnIndexOrThrow("altimetric")))
+                        fixedsObj.put("altitude", fc.getDouble(fc.getColumnIndexOrThrow("altitude")))
+                        surveyDataJson.put("fixeds", fixedsObj)
+                    } else {
+                        throw Exception("No geopoint (fixed station) found for this survey. Please add one in TopoDroid or use 'Join branch' mode.")
+                    }
+                }
+            }
+
+            // 3. Crea il nuovo SQLite con i soli shots della survey
+            SQLiteDatabase.openOrCreateDatabase(uploadSqliteFile, null).use { outDb ->
+                // Ottieni lo schema esatto della tabella shots dal database sorgente
+                var createTableSql = ""
+                srcDb.rawQuery("SELECT sql FROM sqlite_master WHERE type='table' AND name='shots'", null).use { c ->
+                    if (c.moveToFirst()) createTableSql = c.getString(0)
+                }
+                
+                if (createTableSql.isNotEmpty()) {
+                    outDb.execSQL(createTableSql)
+                } else {
+                    // Fallback se non lo trova
+                    outDb.execSQL("CREATE TABLE shots (id INTEGER PRIMARY KEY, surveyId INTEGER, fStation TEXT, tStation TEXT, distance REAL, bearing REAL, clino REAL, roll REAL, acceleration REAL, magnetic REAL, dip REAL, type INTEGER, status INTEGER, comment TEXT, extend INTEGER, leg INTEGER, rawData TEXT, caveArchive INTEGER)")
+                }
+
+                srcDb.query("shots", null, "surveyId = ?", arrayOf(realSurveyId.toString()), null, null, null).use { shotsCursor ->
+                    val count = shotsCursor.count
+                    withContext(Dispatchers.Main) { onLog("Found $count shots for ID $realSurveyId", if (count > 0) Color.Green else Color.Yellow) }
+                    
+                    outDb.beginTransaction()
+                    var insertedCount = 0
+                    try {
+                        while (shotsCursor.moveToNext()) {
+                            val vals = ContentValues()
+                            for (col in shotsCursor.columnNames) {
+                                val idx = shotsCursor.getColumnIndex(col)
+                                when (shotsCursor.getType(idx)) {
+                                    Cursor.FIELD_TYPE_INTEGER -> vals.put(col, shotsCursor.getLong(idx))
+                                    Cursor.FIELD_TYPE_FLOAT -> vals.put(col, shotsCursor.getDouble(idx))
+                                    Cursor.FIELD_TYPE_STRING -> vals.put(col, shotsCursor.getString(idx))
+                                    Cursor.FIELD_TYPE_BLOB -> vals.put(col, shotsCursor.getBlob(idx))
+                                }
+                            }
+                            val rid = outDb.insert("shots", null, vals)
+                            if (rid != -1L) insertedCount++
+                        }
+                        outDb.setTransactionSuccessful()
+                    } finally { outDb.endTransaction() }
+                    withContext(Dispatchers.Main) { onLog("Successfully written $insertedCount shots to local file.", Color.Green) }
+                }
+            }
+        }
+
+        // 4. Carica lo SQLite su Drive (rimuovendo duplicati)
+        withContext(Dispatchers.Main) { 
+            onLog("Temp file size: ${uploadSqliteFile.length()} bytes", Color.Gray)
+            onLog("Cleaning old files on Drive...", Color.Cyan) 
+        }
+        val driveFiles = drive.files().list().setQ("'$folderId' in parents and trashed = false").setFields("files(id, name)").execute().files ?: emptyList()
+        driveFiles.filter { it.name == "$newName.sqlite" }.forEach { 
+            try {
+                drive.files().delete(it.id).execute()
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { onLog("WARNING: Duplicate ${it.name} remains! Please delete it manually on Drive.", Color.Yellow) }
+            }
+        }
+
+        withContext(Dispatchers.Main) { onLog("Uploading new SQLite file...", Color.Cyan) }
+        val driveFileMetadata = File().apply {
+            name = "$newName.sqlite"
+            parents = listOf(folderId)
+        }
+        val mediaContent = com.google.api.client.http.FileContent("application/x-sqlite3", uploadSqliteFile)
+        val uploadedFile = drive.files().create(driveFileMetadata, mediaContent).setFields("id").execute()
+        withContext(Dispatchers.Main) { onLog("SQLite uploaded (ID: ${uploadedFile.id})", Color.Green) }
+
+        // 5. Aggiorna Cave.json
+        withContext(Dispatchers.Main) { onLog("Updating Cave.json...", Color.Cyan) }
+        val caveJsonFile = driveFiles.find { it.name == "Cave.json" }
+        
+        val caveJsonObject = if (caveJsonFile != null) {
+            try {
+                val content = drive.files().get(caveJsonFile.id).executeMediaAsInputStream().bufferedReader(Charset.forName("UTF-8")).use { it.readText() }
+                if (content.isBlank()) JSONObject().apply { put("caves", JSONArray()) }
+                else JSONObject(content)
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { onLog("Warning: Could not parse existing Cave.json, creating new.", Color.Yellow) }
+                JSONObject().apply { put("caves", JSONArray()) }
+            }
+        } else {
+            JSONObject().apply { put("caves", JSONArray()) }
+        }
+
+        if (!caveJsonObject.has("caves")) caveJsonObject.put("caves", JSONArray())
+        val cavesArray = caveJsonObject.getJSONArray("caves")
+        // Se esiste già una survey con lo stesso nome, la aggiorniamo, altrimenti la aggiungiamo
+        var found = false
+        for (i in 0 until cavesArray.length()) {
+            if (cavesArray.getJSONObject(i).getString("name") == newName) {
+                cavesArray.put(i, surveyDataJson)
+                found = true
+                break
+            }
+        }
+        if (!found) cavesArray.put(surveyDataJson)
+
+        val updatedJsonStr = caveJsonObject.toString(3)
+        val jsonFile = JFile(context.cacheDir, "Cave.json")
+        jsonFile.writeText(updatedJsonStr)
+        
+        val jsonMedia = com.google.api.client.http.FileContent("application/json", jsonFile)
+        
+        // Strategia Elimina e Ricrea anche per Cave.json per gestire DRIVE_FILE scope
+        if (caveJsonFile != null) {
+            try {
+                drive.files().delete(caveJsonFile.id).execute()
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { onLog("WARNING: Duplicate Cave.json remains! Please delete the old one manually.", Color.Yellow) }
+            }
+        }
+        
+        val meta = File().apply { name = "Cave.json"; parents = listOf(folderId) }
+        drive.files().create(meta, jsonMedia).execute()
+
+        // 6. Aggiorna eventuale file .tdconfig
+        withContext(Dispatchers.Main) { onLog("Checking for .tdconfig files...", Color.Cyan) }
+        val tdConfigFiles = driveFiles.filter { it.name.lowercase().endsWith(".tdconfig") }
+        for (tdFile in tdConfigFiles) {
+            try {
+                val content = drive.files().get(tdFile.id).executeMediaAsInputStream().bufferedReader(Charset.forName("UTF-8")).use { it.readText() }
+                val lines = content.lines().toMutableList()
+                
+                // Controlla se la survey è già presente (per non duplicarla)
+                val searchPattern = "load \"$newName\""
+                val alreadyPresent = lines.any { it.trim().startsWith(searchPattern) }
+                
+                if (!alreadyPresent) {
+                    // Cerca l'ultima riga "load" o la riga "survey" per inserire la nuova riga
+                    var insertIndex = -1
+                    for (i in lines.indices.reversed()) {
+                        val trimmed = lines[i].trim()
+                        if (trimmed.startsWith("load ") || trimmed.startsWith("survey ")) {
+                            insertIndex = i + 1
+                            break
+                        }
+                    }
+                    
+                    if (insertIndex != -1) {
+                        // Genera un colore randomico
+                        val color = (Math.random() * 16777215).toInt()
+                        lines.add(insertIndex, "    load \"$newName\" -color $color")
+                        
+                        // Aggiungi equate se junctionData è presente
+                        if (junctionData != null) {
+                            // Cerca la posizione dell'equate (alla fine del blocco load o dopo l'ultima equate)
+                            var equateIndex = lines.size - 1
+                            for (i in lines.indices.reversed()) {
+                                if (lines[i].trim() == "endsurvey") {
+                                    equateIndex = i
+                                    break
+                                }
+                            }
+                            // Formato: equate "STATION@CURRENT_SURVEY" "STATION@OTHER_SURVEY"
+                            // Nota: assumo che i nomi delle survey nel tdconfig abbiano il nome usato per l'upload (newName)
+                            // e che per l'altra survey si usi il nome originale o quello trovato nel file? 
+                            // Per ora uso junctionData.otherSurveyName come indicato dall'utente.
+                            lines.add(equateIndex, "    equate \"${junctionData.firstStation}@$newName\" \"${junctionData.secondStation}@${junctionData.otherSurveyName}\"")
+                        }
+
+                        val updatedTdContent = lines.joinToString("\n")
+                        val tempTdFile = JFile(context.cacheDir, tdFile.name)
+                        tempTdFile.writeText(updatedTdContent)
+                        
+                        val tdMedia = com.google.api.client.http.FileContent("application/octet-stream", tempTdFile)
+                        
+                        // Invece di update, eliminiamo e ricreiamo per essere "proprietari" del file sotto DRIVE_FILE scope
+                        try {
+                            drive.files().delete(tdFile.id).execute()
+                        } catch (e: Exception) {
+                            withContext(Dispatchers.Main) { onLog("WARNING: Duplicate ${tdFile.name} remains! Manual delete suggested.", Color.Yellow) }
+                        }
+                        
+                        val meta = File().apply { name = tdFile.name; parents = listOf(folderId) }
+                        drive.files().create(meta, tdMedia).execute()
+
+                        tempTdFile.delete()
+                        withContext(Dispatchers.Main) { onLog("Updated ${tdFile.name}", Color.Green) }
+                    } else {
+                        withContext(Dispatchers.Main) { onLog("ERROR: Could not find insertion point in ${tdFile.name}", Color.Red) }
+                    }
+                } else {
+                    withContext(Dispatchers.Main) { onLog("${tdFile.name} already contains this survey.", Color.Gray) }
+                }
+            } catch (e: Exception) {
+                val errMsg = e.localizedMessage ?: e.toString()
+                withContext(Dispatchers.Main) { onLog("ERROR updating ${tdFile.name}: $errMsg", Color.Red) }
+            }
+        }
+
+        tempSrcDb.delete()
+        uploadSqliteFile.delete()
+        jsonFile.delete()
+        
+        withContext(Dispatchers.Main) { onLog("Upload completed successfully!", Color.Green) }
+    } catch (e: Exception) {
+        val errorMessage = when {
+            e is com.google.api.client.googleapis.json.GoogleJsonResponseException -> {
+                "Drive Error: ${e.details?.message ?: e.message}"
+            }
+            e.message == null -> e.toString()
+            else -> e.message
+        }
+        withContext(Dispatchers.Main) { onLog("Upload ERROR: $errorMessage", Color.Red) }
+        e.printStackTrace()
     }
 }
 

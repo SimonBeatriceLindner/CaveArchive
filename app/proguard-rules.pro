@@ -5,17 +5,37 @@
 # For more details, see
 #   http://developer.android.com/guide/developing/tools/proguard.html
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# Keep Line Numbers for easier debugging of crashes in production
+-keepattributes SourceFile,LineNumberTable
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# --- Google API Client & Drive API ---
+-keep class com.google.api.client.** { *; }
+-keep interface com.google.api.client.** { *; }
+-keep class com.google.api.services.drive.** { *; }
+-keep interface com.google.api.services.drive.** { *; }
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# --- Gson / JSON ---
+# Keep classes used for JSON serialization/deserialization
+-keepattributes Signature
+-keepattributes *Annotation*
+-keep class com.google.gson.** { *; }
+# If you have data classes for JSON (none currently in this project,
+# as we use JSONObject directly, but good to have)
+#-keep class com.cavearchive.app.models.** { *; }
+
+# --- Guava ---
+-dontwarn com.google.common.**
+-keep class com.google.common.** { *; }
+
+# --- Generic reflection rules for Google Libraries ---
+-keepclassmembers class * {
+  @com.google.api.client.util.Key <fields>;
+}
+-dontwarn javax.annotation.**
+-dontwarn javax.inject.**
+-dontwarn sun.misc.Unsafe
+
+# Missing classes from Apache HttpClient dependencies (not on Android)
+-dontwarn javax.naming.**
+-dontwarn org.ietf.jgss.**
+-dontwarn org.apache.http.**
