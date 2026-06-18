@@ -212,24 +212,40 @@ fun MainScreen() {
     LaunchedEffect(selectedFolderUri) {
         selectedFolderUri?.let { uri ->
             scope.launch {
-                val parent = DocumentFile.fromTreeUri(context, uri)
-                isDbFound = parent?.findFile("distox14.sqlite") != null
-                
-                if (isDbFound) {
-                    migrateJsonToDb(context, uri)
-                    archives = emptyList()
-                    val loaded = loadSettings(context, uri)
-                    archives = loaded
-                    val lastUrl = sharedPrefs.getString(KEY_ARCHIVE_URL, "")
-                    selectedArchive = loaded.find { it.url == lastUrl } ?: loaded.firstOrNull()
-                    
-                    if (selectedArchive == null || selectedArchive?.url?.isBlank() == true) {
-                        addLog("Sync disabled: Please configure an Archive URL in settings.", Color.Yellow)
+                try {
+                    val parent = DocumentFile.fromTreeUri(context, uri)
+                    if (parent == null || !parent.canRead()) {
+                        addLog("Permission lost for selected folder. Please re-select.", Color.Red)
+                        isDbFound = false
+                        return@launch
                     }
-                } else {
-                    archives = emptyList()
-                    selectedArchive = null
-                    addLog("Sync disabled: distox14.sqlite not found in selected folder!", Color.Red)
+                    
+                    isDbFound = parent.findFile("distox14.sqlite") != null
+                    
+                    if (isDbFound) {
+                        migrateJsonToDb(context, uri)
+                        archives = emptyList()
+                        val loaded = loadSettings(context, uri)
+                        archives = loaded
+                        val lastUrl = sharedPrefs.getString(KEY_ARCHIVE_URL, "")
+                        selectedArchive = loaded.find { it.url == lastUrl } ?: loaded.firstOrNull()
+                        
+                        if (selectedArchive == null || selectedArchive?.url?.isBlank() == true) {
+                            addLog("Sync disabled: Please configure an Archive URL in settings.", Color.Yellow)
+                        }
+                    } else {
+                        archives = emptyList()
+                        selectedArchive = null
+                        addLog("Sync disabled: distox14.sqlite not found in selected folder!", Color.Red)
+                    }
+                } catch (e: SecurityException) {
+                    addLog("Storage permission error. Please re-select folder.", Color.Red)
+                    isDbFound = false
+                    // Reset folder if permission is permanently lost
+                    // sharedPrefs.edit { remove(KEY_FOLDER_URI) }
+                } catch (e: Exception) {
+                    addLog("Error loading folder: ${e.localizedMessage}", Color.Red)
+                    isDbFound = false
                 }
             }
         } ?: run {
@@ -305,7 +321,7 @@ fun MainScreen() {
             text = {
                 Column {
                     Text("Version: $appVersion")
-                    Text("Release date: May 2026")
+                    Text("Release date: June 2026")
                     Text("Developer: Simon Beatrice Lidner")
                     Row {
                         Text("Email: ")
@@ -427,7 +443,8 @@ fun MainScreen() {
             localFolderUri = selectedFolderUri,
             selectedArchive = selectedArchive,
             onDismiss = { showUploadDialog = false },
-            onLog = { t, c -> addLog(t, c) }
+            onLog = { t, c -> addLog(t, c) },
+            externalScope = scope
         )
     }
 
@@ -751,7 +768,8 @@ fun UploadDialog(
     localFolderUri: Uri?,
     selectedArchive: ArchiveConfig?,
     onDismiss: () -> Unit,
-    onLog: (String, Color) -> Unit
+    onLog: (String, Color) -> Unit,
+    externalScope: kotlinx.coroutines.CoroutineScope
 ) {
     var surveys by remember { mutableStateOf(emptyList<SurveyInfo>()) }
     var selectedSurvey by remember { mutableStateOf<SurveyInfo?>(null) }
@@ -1003,20 +1021,22 @@ fun UploadDialog(
                 onClick = {
                     val survey = selectedSurvey
                     if (survey != null && newName.isNotBlank() && selectedArchive != null && localFolderUri != null) {
-                        isUploading = true
-                        scope.launch {
-                            val junctionData = if (isBranchMode && selectedFirstStation.isNotBlank() && selectedSurveyToConnect != null && selectedSecondStation.isNotBlank()) {
-                                JunctionData(selectedFirstStation, selectedSurveyToConnect!!.name, selectedSecondStation)
-                            } else null
+                        val junctionData = if (isBranchMode && selectedFirstStation.isNotBlank() && selectedSurveyToConnect != null && selectedSecondStation.isNotBlank()) {
+                            JunctionData(selectedFirstStation, selectedSurveyToConnect!!.name, selectedSecondStation)
+                        } else null
+                        
+                        // Chiudi subito il dialogo
+                        onDismiss()
+                        
+                        // Avvia l'upload usando lo scope del MainScreen così non si interrompe
+                        externalScope.launch {
                             uploadSurveyToDrive(context, selectedArchive, localFolderUri, survey, newName, !isBranchMode, junctionData, onLog)
-                            onDismiss()
                         }
                     }
                 },
-                enabled = !isUploading && selectedSurvey != null && newName.isNotBlank()
+                enabled = selectedSurvey != null && newName.isNotBlank()
             ) {
-                if (isUploading) CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                else Text("Upload")
+                Text("Upload")
             }
         },
         dismissButton = {
@@ -1617,18 +1637,17 @@ suspend fun syncDriveFolderOAuth(
     suspend fun safeLog(text: String, color: Color = Color.White) = withContext(Dispatchers.Main) { onLog(text, color) }
     suspend fun <T> runWithRetry(name: String, block: () -> T): T {
         var lastEx: Throwable? = null
+        var currentDelay = 2000L
         for (i in 1..3) {
-            // Priority check for manual stop
             if (checkCancelled()) throw kotlinx.coroutines.CancellationException()
             
             try {
-                return withTimeout(120000) { // 2 minutes timeout
+                return withTimeout(180000) { // Increased to 3 minutes
                     kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
                         block()
                     }
                 }
             } catch (t: Throwable) {
-                // If user pressed Stop, stop immediately without retrying
                 if (t is kotlinx.coroutines.CancellationException && t !is kotlinx.coroutines.TimeoutCancellationException) {
                     throw t
                 }
@@ -1637,14 +1656,30 @@ suspend fun syncDriveFolderOAuth(
                 if (i < 3) {
                     val errorDetail = t.localizedMessage ?: "Timeout or Network error"
                     safeLog("Retry $i/3: $name ($errorDetail)", Color.Yellow)
-                    // Wait before next attempt, but check for cancellation during delay
-                    delay(2000)
+                    delay(currentDelay)
+                    currentDelay *= 2 // Exponential backoff
                 } else {
                     safeLog("Failed after 3 attempts: $name", Color.Red)
                 }
             }
         }
         throw lastEx ?: Exception("Task $name failed after multiple attempts")
+    }
+
+    // Helper to download stream with cancellation check
+    suspend fun downloadFileWithProgress(drive: Drive, driveFileId: String, outputStream: java.io.OutputStream) {
+        val inputStream = drive.files().get(driveFileId).executeMediaAsInputStream()
+        inputStream.use { input ->
+            outputStream.use { output ->
+                val buffer = ByteArray(8192)
+                var bytesRead: Int
+                while (input.read(buffer).also { bytesRead = it } != -1) {
+                    if (checkCancelled()) throw kotlinx.coroutines.CancellationException()
+                    output.write(buffer, 0, bytesRead)
+                }
+                output.flush()
+            }
+        }
     }
 
     try {
@@ -1870,19 +1905,29 @@ suspend fun syncDriveFolderOAuth(
 
             val dest = parentFolder.findFile(folderName) ?: parentFolder.createDirectory(folderName)
             dest?.let { d ->
-                runWithRetry("download ${f.name}") {
+                try {
                     val target = d.findFile(f.name) ?: d.createFile(f.mimeType, f.name)
                     target?.let { t -> 
-                        context.contentResolver.openOutputStream(t.uri)?.use { drive.files().get(f.id).executeMediaAndDownloadTo(it) }
+                        runWithRetry("download ${f.name}") {
+                            context.contentResolver.openOutputStream(t.uri)?.use { outStream ->
+                                kotlinx.coroutines.runBlocking {
+                                    downloadFileWithProgress(drive, f.id, outStream)
+                                }
+                            }
+                        }
+                        // Solo se il download ha avuto successo, aggiungiamo ai metadata
                         downloadedPathsMetadata.add(JSONObject().apply {
                             put("path", path)
                             put("drive_id", f.id)
                             put("modified_time", currentModifiedTime)
                         })
                     }
+                    safeLog("Saved: ${f.name}", Color.Gray)
+                    dlCount++
+                } catch (e: Exception) {
+                    if (e is kotlinx.coroutines.CancellationException) throw e
+                    safeLog("Failed to save ${f.name}: ${e.localizedMessage}", Color.Red)
                 }
-                safeLog("Saved: ${f.name}", Color.Gray)
-                dlCount++
             }
         }
         
