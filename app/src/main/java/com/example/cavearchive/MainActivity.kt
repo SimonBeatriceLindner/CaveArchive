@@ -8,7 +8,6 @@ import android.content.Intent
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
@@ -42,6 +41,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FormatPaint
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -59,7 +59,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.MenuAnchorType
+import androidx.compose.material3.ExposedDropdownMenuAnchorType
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
@@ -96,6 +96,7 @@ import com.google.android.gms.auth.api.signin.GoogleSignInOptions
 import com.google.android.gms.common.api.Scope
 import com.google.api.client.extensions.android.http.AndroidHttp
 import com.google.api.client.googleapis.extensions.android.gms.auth.GoogleAccountCredential
+import com.google.api.client.googleapis.json.GoogleJsonResponseException
 import com.google.api.client.json.gson.GsonFactory
 import com.google.api.services.drive.Drive
 import com.google.api.services.drive.DriveScopes
@@ -103,18 +104,16 @@ import com.google.api.services.drive.model.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedInputStream
 import java.io.FileOutputStream
-import java.io.InputStreamReader
 import java.nio.charset.Charset
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Collections
-import java.util.zip.ZipInputStream
 import java.io.File as JFile
 
 data class LogMessage(val text: String, val color: Color, val time: String)
@@ -186,25 +185,24 @@ fun MainScreen() {
         logs.add(LogMessage(text, color, currentTime))
     }
 
+    fun updateLog(text: String, color: Color = Color.White) {
+        if (logs.isNotEmpty()) {
+            val last = logs.last()
+            logs[logs.size - 1] = last.copy(text = text, color = color)
+        } else {
+            addLog(text, color)
+        }
+    }
+
     val selectedFolderUriString = sharedPrefs.getString(KEY_FOLDER_URI, null)
     var selectedFolderUri by remember {
         mutableStateOf(selectedFolderUriString?.toUri())
     }
 
-    // Caricamento permessi e cartella di default
+    // Caricamento permessi
     LaunchedEffect(Unit) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            if (!Environment.isExternalStorageManager()) {
-                showPermissionDialog = true
-            } else if (sharedPrefs.getString(KEY_FOLDER_URI, null) == null) {
-                val defaultPath = JFile(Environment.getExternalStorageDirectory(), "Documents/TDX/TopoDroid")
-                if (defaultPath.exists() && defaultPath.isDirectory) {
-                    val uri = Uri.fromFile(defaultPath)
-                    sharedPrefs.edit { putString(KEY_FOLDER_URI, uri.toString()) }
-                    selectedFolderUri = uri
-                    addLog("Default folder set: TopoDroid", Color.Cyan)
-                }
-            }
+        if (!Environment.isExternalStorageManager()) {
+            showPermissionDialog = true
         }
     }
 
@@ -227,8 +225,15 @@ fun MainScreen() {
                         archives = emptyList()
                         val loaded = loadSettings(context, uri)
                         archives = loaded
+                        addLog("Loaded ${loaded.size} archives from database.", Color.Gray)
+
                         val lastUrl = sharedPrefs.getString(KEY_ARCHIVE_URL, "")
                         selectedArchive = loaded.find { it.url == lastUrl } ?: loaded.firstOrNull()
+                        
+                        // Assicuriamoci che l'URL corrente sia salvato per ricaricamenti futuri
+                        selectedArchive?.let { 
+                            sharedPrefs.edit { putString(KEY_ARCHIVE_URL, it.url) }
+                        }
                         
                         if (selectedArchive == null || selectedArchive?.url?.isBlank() == true) {
                             addLog("Sync disabled: Please configure an Archive URL in settings.", Color.Yellow)
@@ -241,8 +246,6 @@ fun MainScreen() {
                 } catch (e: SecurityException) {
                     addLog("Storage permission error. Please re-select folder.", Color.Red)
                     isDbFound = false
-                    // Reset folder if permission is permanently lost
-                    // sharedPrefs.edit { remove(KEY_FOLDER_URI) }
                 } catch (e: Exception) {
                     addLog("Error loading folder: ${e.localizedMessage}", Color.Red)
                     isDbFound = false
@@ -266,7 +269,16 @@ fun MainScreen() {
             scope.launch {
                 saveSettings(context, uri, newList)
                 // Reload immediately to get correctly assigned IDs from DB
-                archives = loadSettings(context, uri)
+                val loaded = loadSettings(context, uri)
+                archives = loaded
+                
+                // Se non c'è una selezione o quella attuale è sparita, seleziona il primo disponibile
+                if (selectedArchive == null || loaded.none { it.url == selectedArchive?.url }) {
+                    selectedArchive = loaded.firstOrNull()
+                    selectedArchive?.let { 
+                        sharedPrefs.edit { putString(KEY_ARCHIVE_URL, it.url) }
+                    }
+                }
             }
         }
     }
@@ -304,10 +316,10 @@ fun MainScreen() {
             text = { Text("The app requires access to all files to manage TopoDroid folders.") },
             confirmButton = {
                 TextButton(onClick = {
-                    showPermissionDialog = false
                     val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-                        data = Uri.parse("package:${context.packageName}")
+                        data = Uri.fromParts("package", context.packageName, null)
                     }
+                    showPermissionDialog = false
                     context.startActivity(intent)
                 }) { Text("Settings") }
             }
@@ -390,7 +402,7 @@ fun MainScreen() {
 
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "Only data managed by CaveArchive (marked in the 'caveArchive' column) will be removed. Your personal surveys will remain safe.",
+                        "Only data managed by CaveArchive (marked in the 'archiveId' column) will be removed. Your personal surveys will remain safe.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error
                     )
@@ -408,7 +420,7 @@ fun MainScreen() {
                                     addLog(msg, if (success) Color.Green else Color.Red)
                                 }
                             }
-                        } else if (!wipeAllData && targetId == 0) {
+                        } else if (targetId == 0) {
                             addLog("Error: Archive ID not valid. Please restart the app.", Color.Red)
                         }
                     }
@@ -424,14 +436,12 @@ fun MainScreen() {
         ManageArchivesDialog(
             initialArchives = archives,
             currentFolderUri = selectedFolderUri,
+            isDbFound = isDbFound,
             onFolderRequest = { folderLauncher.launch(null) },
             onDismiss = { showManageArchivesDialog = false },
             onSave = { newList ->
                 saveAndRefreshArchives(newList)
-                if (selectedArchive == null || newList.none { it.id == selectedArchive?.id }) {
-                    selectedArchive = newList.firstOrNull()
-                    sharedPrefs.edit { putString(KEY_ARCHIVE_URL, selectedArchive?.url ?: "") }
-                }
+                // Usiamo newList per trovare quello salvato, ma saveAndRefreshArchives è asincrono.
                 showManageArchivesDialog = false
             }
         )
@@ -467,6 +477,14 @@ fun MainScreen() {
                         DropdownMenuItem(
                             text = { Text("Upload") },
                             onClick = { showMenu = false; showUploadDialog = true }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Site") },
+                            onClick = {
+                                showMenu = false
+                                val intent = Intent(Intent.ACTION_VIEW, Uri.parse("http://www.cavearchive.it/"))
+                                context.startActivity(intent)
+                            }
                         )
                         DropdownMenuItem(
                             text = { Text("Logout") },
@@ -537,10 +555,14 @@ fun MainScreen() {
                                 } else {
                                     syncJob = scope.launch {
                                         try {
+                                            if (selectedArchive!!.id <= 0) {
+                                                addLog("Error: Archive ID not initialized. Please re-select the archive.", Color.Red)
+                                                return@launch
+                                            }
                                             isSyncing = true
                                             isCancelled = false
                                             addLog("Sync started...", Color.Cyan)
-                                            val (res, msg) = syncDriveFolderOAuth(context, selectedArchive!!, selectedFolderUri!!, ::addLog, { isCancelled })
+                                            val (res, msg) = syncDriveFolderOAuth(context, selectedArchive!!, selectedFolderUri!!, ::addLog, ::updateLog) { isCancelled }
                                             isSyncing = false
                                             addLog(msg, if (res) Color.Green else Color.Red)
                                         } catch (t: Throwable) {
@@ -646,6 +668,7 @@ fun MainScreen() {
 fun ManageArchivesDialog(
     initialArchives: List<ArchiveConfig>,
     currentFolderUri: Uri?,
+    isDbFound: Boolean,
     onFolderRequest: () -> Unit,
     onDismiss: () -> Unit,
     onSave: (List<ArchiveConfig>) -> Unit
@@ -654,6 +677,7 @@ fun ManageArchivesDialog(
     var showAddDialog by remember { mutableStateOf(false) }
     var editingArchive by remember { mutableStateOf<ArchiveConfig?>(null) }
     val listState = rememberLazyListState()
+    val context = LocalContext.current
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -719,6 +743,16 @@ fun ManageArchivesDialog(
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
+                                IconButton(onClick = {
+                                    try {
+                                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(arch.url))
+                                        context.startActivity(intent)
+                                    } catch (e: Exception) {
+                                        Toast.makeText(context, "Cannot open URL", Toast.LENGTH_SHORT).show()
+                                    }
+                                }) {
+                                    Icon(Icons.Default.Public, contentDescription = "Open in Drive", tint = MaterialTheme.colorScheme.primary)
+                                }
                                 IconButton(onClick = { editingArchive = arch; showAddDialog = true }) { Icon(Icons.Default.Edit, null) }
                                 IconButton(onClick = { list = list.filter { it.id != arch.id || (it.id == 0 && it != arch) } }) { Icon(Icons.Default.Delete, null, tint = Color.Red) }
                             }
@@ -727,7 +761,11 @@ fun ManageArchivesDialog(
                     }
                 }
 
-                Button(onClick = { editingArchive = null; showAddDialog = true }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                Button(
+                    onClick = { editingArchive = null; showAddDialog = true }, 
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    enabled = isDbFound
+                ) {
                     Icon(Icons.Default.Add, null); Spacer(Modifier.width(8.dp)); Text("Add Archive")
                 }
             }
@@ -857,7 +895,7 @@ fun UploadDialog(
                             onValueChange = {},
                             readOnly = true,
                             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedSurvey) },
-                            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable).fillMaxWidth()
+                            modifier = Modifier.menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable).fillMaxWidth()
                         )
                         ExposedDropdownMenu(
                             expanded = expandedSurvey,
@@ -927,7 +965,7 @@ fun UploadDialog(
                                 },
                                 label = { Text("Search station") },
                                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedFirstStation) },
-                                modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryEditable).fillMaxWidth()
+                                modifier = Modifier.menuAnchor(ExposedDropdownMenuAnchorType.PrimaryEditable).fillMaxWidth()
                             )
                             ExposedDropdownMenu(
                                 expanded = expandedFirstStation,
@@ -958,7 +996,7 @@ fun UploadDialog(
                                 onValueChange = {},
                                 readOnly = true,
                                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedSurveyToConnect) },
-                                modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable).fillMaxWidth()
+                                modifier = Modifier.menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable).fillMaxWidth()
                             )
                             ExposedDropdownMenu(
                                 expanded = expandedSurveyToConnect,
@@ -993,7 +1031,7 @@ fun UploadDialog(
                                     },
                                     label = { Text("Search station") },
                                     trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedSecondStation) },
-                                    modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryEditable).fillMaxWidth()
+                                    modifier = Modifier.menuAnchor(ExposedDropdownMenuAnchorType.PrimaryEditable).fillMaxWidth()
                                 )
                                 ExposedDropdownMenu(
                                     expanded = expandedSecondStation,
@@ -1081,8 +1119,8 @@ suspend fun loadArchiveSurveysFromDb(context: Context, folderUri: Uri, archiveId
             FileOutputStream(tempDb).use { output -> input.copyTo(output) }
         }
         SQLiteDatabase.openDatabase(tempDb.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { db ->
-            // Query the main 'surveys' table directly using the 'caveArchive' column
-            db.query("surveys", arrayOf("id", "name"), "caveArchive = ?", arrayOf(archiveId.toString()), null, null, "name ASC").use { cursor ->
+            // Query the main 'surveys' table directly using the 'archiveId' column
+            db.query("surveys", arrayOf("id", "name"), "archiveId = ?", arrayOf(archiveId.toString()), null, null, "name ASC").use { cursor ->
                 while (cursor.moveToNext()) {
                     list.add(SurveyInfo(cursor.getInt(0), cursor.getString(1)))
                 }
@@ -1114,6 +1152,81 @@ suspend fun loadSurveysFromDb(context: Context, folderUri: Uri): List<SurveyInfo
     list
 }
 
+fun getOrCreateFolder(drive: Drive, parentId: String, name: String): String {
+    val list = drive.files().list()
+        .setQ("'$parentId' in parents and name = '$name' and mimeType = 'application/vnd.google-apps.folder' and trashed = false")
+        .execute().files ?: emptyList()
+    if (list.isNotEmpty()) return list[0].id
+    val meta = File().apply {
+        setName(name); setMimeType("application/vnd.google-apps.folder"); setParents(
+        listOf(
+            parentId
+        )
+    )
+    }
+    return drive.files().create(meta).setFields("id").execute().id
+}
+
+fun createUploadShotsDatabase(
+    uploadSqliteFile: JFile,
+    srcDb: SQLiteDatabase,
+    realSurveyId: Int
+) {
+    val outDb = SQLiteDatabase.openOrCreateDatabase(uploadSqliteFile.absolutePath, null)
+    val tableStructureSql: String = srcDb.rawQuery(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='shots'",
+        null
+    ).use { c ->
+        if (c.moveToFirst()) c.getString(0) ?: "" else ""
+    }
+
+    try {
+        if (tableStructureSql.isNotEmpty()) {
+            outDb.execSQL(tableStructureSql)
+        } else {
+            outDb.execSQL("CREATE TABLE shots (id INTEGER PRIMARY KEY, surveyId INTEGER, fStation TEXT, tStation TEXT, distance REAL, bearing REAL, clino REAL, roll REAL, acceleration REAL, magnetic REAL, dip REAL, type INTEGER, status INTEGER, comment TEXT, extend INTEGER, leg INTEGER, rawData TEXT, archiveId INTEGER)")
+        }
+
+        srcDb.query(
+            "shots",
+            null,
+            "surveyId = ?",
+            arrayOf(realSurveyId.toString()),
+            null,
+            null,
+            null
+        ).use { shotsCursor ->
+            outDb.beginTransaction()
+            try {
+                while (shotsCursor.moveToNext()) {
+                    val vals = ContentValues()
+                    for (col in shotsCursor.columnNames) {
+                        if (col == "caveArchive") continue // Skip old column name during upload creation
+                        val idx = shotsCursor.getColumnIndex(col)
+                        when (shotsCursor.getType(idx)) {
+                            Cursor.FIELD_TYPE_INTEGER -> vals.put(col, shotsCursor.getLong(idx))
+                            Cursor.FIELD_TYPE_FLOAT -> vals.put(col, shotsCursor.getDouble(idx))
+                            Cursor.FIELD_TYPE_STRING -> vals.put(
+                                col,
+                                shotsCursor.getString(idx)
+                            )
+
+                            Cursor.FIELD_TYPE_BLOB -> vals.put(col, shotsCursor.getBlob(idx))
+                            else -> vals.putNull(col)
+                        }
+                    }
+                    outDb.insert("shots", null, vals)
+                }
+                outDb.setTransactionSuccessful()
+            } finally {
+                outDb.endTransaction()
+            }
+        }
+    } finally {
+        outDb.close()
+    }
+}
+
 suspend fun uploadSurveyToDrive(
     context: Context,
     archive: ArchiveConfig,
@@ -1123,20 +1236,31 @@ suspend fun uploadSurveyToDrive(
     uploadGeopoint: Boolean,
     junctionData: JunctionData?,
     onLog: (String, Color) -> Unit
-) = withContext(Dispatchers.IO) {
+) {
     try {
         withContext(Dispatchers.Main) { onLog("Starting upload: $newName", Color.Cyan) }
-        val account = GoogleSignIn.getLastSignedInAccount(context) ?: return@withContext
-        val credential = GoogleAccountCredential.usingOAuth2(context, Collections.singleton(DriveScopes.DRIVE_FILE)).apply { selectedAccount = account.account }
-        val drive = Drive.Builder(AndroidHttp.newCompatibleTransport(), GsonFactory.getDefaultInstance(), credential).setApplicationName("CaveArchive").build()
+        val account = GoogleSignIn.getLastSignedInAccount(context) ?: return
+        val credential = GoogleAccountCredential.usingOAuth2(
+            context,
+            Collections.singleton(DriveScopes.DRIVE_FILE)
+        ).apply { selectedAccount = account.account }
+        val drive = Drive.Builder(
+            AndroidHttp.newCompatibleTransport(),
+            GsonFactory.getDefaultInstance(),
+            credential
+        ).setApplicationName("CaveArchive").build()
 
-        val folderId = if (archive.url.contains("/folders/")) archive.url.split("/folders/").getOrNull(1)?.split("?")?.getOrNull(0)
-                       else if (archive.url.contains("id=")) archive.url.split("id=").getOrNull(1)?.split("&")?.getOrNull(0)
-                       else null ?: return@withContext
+        val folderId = (if (archive.url.contains("/folders/")) {
+            archive.url.split("/folders/").getOrNull(1)?.split("?")?.getOrNull(0)
+        } else if (archive.url.contains("id=")) {
+            archive.url.split("id=").getOrNull(1)?.split("&")?.getOrNull(0)
+        } else {
+            null
+        }) ?: return
 
-        val parent = DocumentFile.fromTreeUri(context, localFolderUri) ?: return@withContext
-        val dbDocFile = parent.findFile("distox14.sqlite") ?: return@withContext
-        
+        val parent = DocumentFile.fromTreeUri(context, localFolderUri) ?: return
+        val dbDocFile = parent.findFile("distox14.sqlite") ?: return
+
         val tempSrcDb = JFile(context.cacheDir, "temp_src_upload.sqlite")
         context.contentResolver.openInputStream(dbDocFile.uri)?.use { input ->
             FileOutputStream(tempSrcDb).use { output -> input.copyTo(output) }
@@ -1144,39 +1268,90 @@ suspend fun uploadSurveyToDrive(
 
         val uploadSqliteFile = JFile(context.cacheDir, "$newName.sqlite")
         if (uploadSqliteFile.exists()) uploadSqliteFile.delete()
-        var surveyDataJson = JSONObject()
-        
-        SQLiteDatabase.openDatabase(tempSrcDb.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { srcDb ->
-            // 0. Trova l'ID reale della survey nel DB (nel caso fosse cambiato o diverso)
+        val surveyDataJson = JSONObject()
+
+        val srcDb = SQLiteDatabase.openDatabase(tempSrcDb.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
+        try {
             var realSurveyId = survey.id
-            srcDb.query("surveys", arrayOf("id"), "name = ?", arrayOf(survey.name), null, null, null).use { c ->
+            srcDb.query(
+                "surveys",
+                arrayOf("id"),
+                "name = ?",
+                arrayOf(survey.name),
+                null,
+                null,
+                null
+            ).use { c ->
                 if (c.moveToFirst()) realSurveyId = c.getInt(0)
             }
-            withContext(Dispatchers.Main) { onLog("Processing Survey ID: $realSurveyId (${survey.name})", Color.Gray) }
+            withContext(Dispatchers.Main) {
+                onLog(
+                    "Processing Survey ID: $realSurveyId (${survey.name})",
+                    Color.Gray
+                )
+            }
 
-            // 1. Leggi dati survey
-            srcDb.query("surveys", null, "id = ?", arrayOf(realSurveyId.toString()), null, null, null).use { sc ->
+            srcDb.query(
+                "surveys",
+                null,
+                "id = ?",
+                arrayOf(realSurveyId.toString()),
+                null,
+                null,
+                null
+            ).use { sc ->
                 if (sc.moveToFirst()) {
                     surveyDataJson.put("name", newName)
                     surveyDataJson.put("day", sc.getString(sc.getColumnIndexOrThrow("day")))
                     surveyDataJson.put("team", sc.getString(sc.getColumnIndexOrThrow("team")))
-                    surveyDataJson.put("comment", sc.getString(sc.getColumnIndexOrThrow("comment")))
-                    surveyDataJson.put("declination", sc.getString(sc.getColumnIndexOrThrow("declination")))
-                    surveyDataJson.put("init_station", sc.getString(sc.getColumnIndexOrThrow("init_station")))
-                    surveyDataJson.put("shotsFile", "$newName.sqlite")
+                    surveyDataJson.put(
+                        "comment",
+                        sc.getString(sc.getColumnIndexOrThrow("comment"))
+                    )
+                    surveyDataJson.put(
+                        "declination",
+                        sc.getString(sc.getColumnIndexOrThrow("declination"))
+                    )
+                    surveyDataJson.put(
+                        "init_station",
+                        sc.getString(sc.getColumnIndexOrThrow("init_station"))
+                    )
+                    surveyDataJson.put("shotsFile", "caves/$newName.sqlite")
                 }
             }
 
-            // 2. Leggi fixeds
             if (uploadGeopoint) {
-                srcDb.query("fixeds", null, "surveyId = ?", arrayOf(realSurveyId.toString()), null, null, null).use { fc ->
+                srcDb.query(
+                    "fixeds",
+                    null,
+                    "surveyId = ?",
+                    arrayOf(realSurveyId.toString()),
+                    null,
+                    null,
+                    null
+                ).use { fc ->
                     if (fc.moveToFirst()) {
                         val fixedsObj = JSONObject()
-                        fixedsObj.put("station", fc.getString(fc.getColumnIndexOrThrow("station")))
-                        fixedsObj.put("longitude", fc.getDouble(fc.getColumnIndexOrThrow("longitude")))
-                        fixedsObj.put("latitude", fc.getDouble(fc.getColumnIndexOrThrow("latitude")))
-                        fixedsObj.put("altimetric", fc.getDouble(fc.getColumnIndexOrThrow("altimetric")))
-                        fixedsObj.put("altitude", fc.getDouble(fc.getColumnIndexOrThrow("altitude")))
+                        fixedsObj.put(
+                            "station",
+                            fc.getString(fc.getColumnIndexOrThrow("station"))
+                        )
+                        fixedsObj.put(
+                            "longitude",
+                            fc.getDouble(fc.getColumnIndexOrThrow("longitude"))
+                        )
+                        fixedsObj.put(
+                            "latitude",
+                            fc.getDouble(fc.getColumnIndexOrThrow("latitude"))
+                        )
+                        fixedsObj.put(
+                            "altimetric",
+                            fc.getDouble(fc.getColumnIndexOrThrow("altimetric"))
+                        )
+                        fixedsObj.put(
+                            "altitude",
+                            fc.getDouble(fc.getColumnIndexOrThrow("altitude"))
+                        )
                         surveyDataJson.put("fixeds", fixedsObj)
                     } else {
                         throw Exception("No geopoint (fixed station) found for this survey. Please add one in TopoDroid or use 'Join branch' mode.")
@@ -1185,344 +1360,1130 @@ suspend fun uploadSurveyToDrive(
             }
 
             // 3. Crea il nuovo SQLite con i soli shots della survey
-            SQLiteDatabase.openOrCreateDatabase(uploadSqliteFile, null).use { outDb ->
-                // Ottieni lo schema esatto della tabella shots dal database sorgente
-                var createTableSql = ""
-                srcDb.rawQuery("SELECT sql FROM sqlite_master WHERE type='table' AND name='shots'", null).use { c ->
-                    if (c.moveToFirst()) createTableSql = c.getString(0)
-                }
-                
-                if (createTableSql.isNotEmpty()) {
-                    outDb.execSQL(createTableSql)
-                } else {
-                    // Fallback se non lo trova
-                    outDb.execSQL("CREATE TABLE shots (id INTEGER PRIMARY KEY, surveyId INTEGER, fStation TEXT, tStation TEXT, distance REAL, bearing REAL, clino REAL, roll REAL, acceleration REAL, magnetic REAL, dip REAL, type INTEGER, status INTEGER, comment TEXT, extend INTEGER, leg INTEGER, rawData TEXT, caveArchive INTEGER)")
-                }
-
-                srcDb.query("shots", null, "surveyId = ?", arrayOf(realSurveyId.toString()), null, null, null).use { shotsCursor ->
-                    val count = shotsCursor.count
-                    withContext(Dispatchers.Main) { onLog("Found $count shots for ID $realSurveyId", if (count > 0) Color.Green else Color.Yellow) }
-                    
-                    outDb.beginTransaction()
-                    var insertedCount = 0
-                    try {
-                        while (shotsCursor.moveToNext()) {
-                            val vals = ContentValues()
-                            for (col in shotsCursor.columnNames) {
-                                val idx = shotsCursor.getColumnIndex(col)
-                                when (shotsCursor.getType(idx)) {
-                                    Cursor.FIELD_TYPE_INTEGER -> vals.put(col, shotsCursor.getLong(idx))
-                                    Cursor.FIELD_TYPE_FLOAT -> vals.put(col, shotsCursor.getDouble(idx))
-                                    Cursor.FIELD_TYPE_STRING -> vals.put(col, shotsCursor.getString(idx))
-                                    Cursor.FIELD_TYPE_BLOB -> vals.put(col, shotsCursor.getBlob(idx))
-                                }
-                            }
-                            val rid = outDb.insert("shots", null, vals)
-                            if (rid != -1L) insertedCount++
-                        }
-                        outDb.setTransactionSuccessful()
-                    } finally { outDb.endTransaction() }
-                    withContext(Dispatchers.Main) { onLog("Successfully written $insertedCount shots to local file.", Color.Green) }
-                }
-            }
+            createUploadShotsDatabase(uploadSqliteFile, srcDb, realSurveyId)
+        } finally {
+            srcDb.close()
         }
 
-        // 4. Carica lo SQLite su Drive (rimuovendo duplicati)
-        withContext(Dispatchers.Main) { 
-            onLog("Temp file size: ${uploadSqliteFile.length()} bytes", Color.Gray)
-            onLog("Cleaning old files on Drive...", Color.Cyan) 
+        val cavesFolderId = getOrCreateFolder(drive, folderId, "caves")
+        val projectsFolderId = getOrCreateFolder(drive, folderId, "projects")
+
+        withContext(Dispatchers.Main) {
+            onLog(
+                "Cleaning old files in caves/ folder...",
+                Color.Cyan
+            )
         }
-        val driveFiles = drive.files().list().setQ("'$folderId' in parents and trashed = false").setFields("files(id, name)").execute().files ?: emptyList()
-        driveFiles.filter { it.name == "$newName.sqlite" }.forEach { 
+        val caveDirFiles =
+            drive.files().list().setQ("'$cavesFolderId' in parents and trashed = false")
+                .setFields("files(id, name)").execute().files ?: emptyList()
+        caveDirFiles.filter { it.name == "$newName.sqlite" }.forEach {
             try {
                 drive.files().delete(it.id).execute()
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { onLog("WARNING: Duplicate ${it.name} remains! Please delete it manually on Drive.", Color.Yellow) }
+                withContext(Dispatchers.Main) {
+                    onLog(
+                        "WARNING: Duplicate ${it.name} remains in caves/!",
+                        Color.Yellow
+                    )
+                }
             }
         }
 
-        withContext(Dispatchers.Main) { onLog("Uploading new SQLite file...", Color.Cyan) }
-        val driveFileMetadata = File().apply {
-            name = "$newName.sqlite"
-            parents = listOf(folderId)
-        }
-        val mediaContent = com.google.api.client.http.FileContent("application/x-sqlite3", uploadSqliteFile)
-        val uploadedFile = drive.files().create(driveFileMetadata, mediaContent).setFields("id").execute()
-        withContext(Dispatchers.Main) { onLog("SQLite uploaded (ID: ${uploadedFile.id})", Color.Green) }
+        withContext(Dispatchers.Main) { onLog("Uploading new SQLite to caves/...", Color.Cyan) }
+        val driveFileMetadata =
+            File().apply { setName("$newName.sqlite"); setParents(listOf(cavesFolderId)) }
+        val mediaContent =
+            com.google.api.client.http.FileContent("application/x-sqlite3", uploadSqliteFile)
+        drive.files().create(driveFileMetadata, mediaContent).execute()
 
-        // 5. Aggiorna Cave.json
-        withContext(Dispatchers.Main) { onLog("Updating Cave.json...", Color.Cyan) }
-        val caveJsonFile = driveFiles.find { it.name == "Cave.json" }
-        
-        val caveJsonObject = if (caveJsonFile != null) {
-            try {
-                val content = drive.files().get(caveJsonFile.id).executeMediaAsInputStream().bufferedReader(Charset.forName("UTF-8")).use { it.readText() }
-                if (content.isBlank()) JSONObject().apply { put("caves", JSONArray()) }
-                else JSONObject(content)
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) { onLog("Warning: Could not parse existing Cave.json, creating new.", Color.Yellow) }
-                JSONObject().apply { put("caves", JSONArray()) }
-            }
+        val rootFiles = drive.files().list().setQ("'$folderId' in parents and trashed = false")
+            .setFields("files(id, name)").execute().files ?: emptyList()
+        val cavesJsonPattern = Regex("caves([0-9a-fA-F]{5})\\.json")
+        val cavesJsonFiles = rootFiles.mapNotNull { f ->
+            val match = cavesJsonPattern.matchEntire(f.name)
+            if (match != null) f to match.groupValues[1].toInt(16) else null
+        }.sortedByDescending { it.second }
+
+        val latestVersion = cavesJsonFiles.firstOrNull()?.second ?: 0
+        val nextVersion = latestVersion + 1
+        val nextName = "caves${nextVersion.toString(16).padStart(5, '0').uppercase()}.json"
+
+        val caveJsonObject = if (cavesJsonFiles.isNotEmpty()) {
+            val content =
+                drive.files().get(cavesJsonFiles.first().first.id).executeMediaAsInputStream()
+                    .bufferedReader(Charset.forName("UTF-8")).use { it.readText() }
+            JSONObject(content)
         } else {
             JSONObject().apply { put("caves", JSONArray()) }
         }
 
-        if (!caveJsonObject.has("caves")) caveJsonObject.put("caves", JSONArray())
-        val cavesArray = caveJsonObject.getJSONArray("caves")
-        // Se esiste già una survey con lo stesso nome, la aggiorniamo, altrimenti la aggiungiamo
+        val cavesArray = caveJsonObject.optJSONArray("caves") ?: JSONArray().also {
+            caveJsonObject.put(
+                "caves",
+                it
+            )
+        }
         var found = false
         for (i in 0 until cavesArray.length()) {
             if (cavesArray.getJSONObject(i).getString("name") == newName) {
                 cavesArray.put(i, surveyDataJson)
-                found = true
-                break
+                found = true; break
             }
         }
-        if (!found) cavesArray.put(surveyDataJson)
+        // 6. Aggiorna eventuale file .tdconfig (nella cartella projects/)
+        val projectDirFiles =
+            drive.files().list().setQ("'$projectsFolderId' in parents and trashed = false")
+                .setFields("files(id, name)").execute().files ?: emptyList()
+        val tdPattern = Regex("(.+?)([0-9a-fA-F]{5})\\.tdconfig")
 
-        val updatedJsonStr = caveJsonObject.toString(3)
-        val jsonFile = JFile(context.cacheDir, "Cave.json")
-        jsonFile.writeText(updatedJsonStr)
-        
-        val jsonMedia = com.google.api.client.http.FileContent("application/json", jsonFile)
-        
-        // Strategia Elimina e Ricrea anche per Cave.json per gestire DRIVE_FILE scope
-        if (caveJsonFile != null) {
-            try {
-                drive.files().delete(caveJsonFile.id).execute()
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) { onLog("WARNING: Duplicate Cave.json remains! Please delete the old one manually.", Color.Yellow) }
+        // Identifica il progetto corrente se presente
+        val currentProjectPath = caveJsonObject.optString("projectFile")
+
+        if (currentProjectPath.isNotEmpty()) {
+            val baseName = currentProjectPath.split("/").last().let { name ->
+                tdPattern.matchEntire(name)?.groupValues?.get(1) ?: name.removeSuffix(".tdconfig")
             }
-        }
-        
-        val meta = File().apply { name = "Cave.json"; parents = listOf(folderId) }
-        drive.files().create(meta, jsonMedia).execute()
 
-        // 6. Aggiorna eventuale file .tdconfig
-        withContext(Dispatchers.Main) { onLog("Checking for .tdconfig files...", Color.Cyan) }
-        val tdConfigFiles = driveFiles.filter { it.name.lowercase().endsWith(".tdconfig") }
-        for (tdFile in tdConfigFiles) {
-            try {
-                val content = drive.files().get(tdFile.id).executeMediaAsInputStream().bufferedReader(Charset.forName("UTF-8")).use { it.readText() }
-                val lines = content.lines().toMutableList()
-                
-                // Controlla se la survey è già presente (per non duplicarla)
-                val searchPattern = "load \"$newName\""
-                val alreadyPresent = lines.any { it.trim().startsWith(searchPattern) }
-                
-                if (!alreadyPresent) {
-                    // Cerca l'ultima riga "load" o la riga "survey" per inserire la nuova riga
-                    var insertIndex = -1
-                    for (i in lines.indices.reversed()) {
-                        val trimmed = lines[i].trim()
-                        if (trimmed.startsWith("load ") || trimmed.startsWith("survey ")) {
-                            insertIndex = i + 1
-                            break
-                        }
-                    }
-                    
-                    if (insertIndex != -1) {
-                        // Genera un colore randomico
-                        val color = (Math.random() * 16777215).toInt()
-                        lines.add(insertIndex, "    load \"$newName\" -color $color")
-                        
-                        // Aggiungi equate se junctionData è presente
-                        if (junctionData != null) {
-                            // Cerca la posizione dell'equate (alla fine del blocco load o dopo l'ultima equate)
-                            var equateIndex = lines.size - 1
-                            for (i in lines.indices.reversed()) {
-                                if (lines[i].trim() == "endsurvey") {
-                                    equateIndex = i
-                                    break
-                                }
+            // Cerchiamo tutti i .tdconfig dello stesso progetto
+            val versions =
+                projectDirFiles.filter { it.name.startsWith(baseName) && it.name.endsWith(".tdconfig") }
+
+            if (versions.isNotEmpty()) {
+                try {
+                    val latest = versions.mapNotNull { f ->
+                        val m = tdPattern.matchEntire(f.name)
+                        if (m != null) f to m.groupValues[2].toInt(16) else f to 0
+                    }.maxByOrNull { it.second }!!
+
+                    val currentFile = latest.first
+                    val nextVer = latest.second + 1
+                    val nextName =
+                        "$baseName${nextVer.toString(16).padStart(5, '0').uppercase()}.tdconfig"
+                    val nextPath = "projects/$nextName"
+
+                    val content = drive.files().get(currentFile.id).executeMediaAsInputStream()
+                        .bufferedReader(Charset.forName("UTF-8")).use { it.readText() }
+                    val lines = content.lines().toMutableList()
+                    val searchPattern = "load \"$newName\""
+
+                    if (!lines.any { it.trim().startsWith(searchPattern) }) {
+                        var insertIndex = -1
+                        for (i in lines.indices.reversed()) {
+                            if (lines[i].trim().startsWith("load ") || lines[i].trim()
+                                    .startsWith("survey ")
+                            ) {
+                                insertIndex = i + 1; break
                             }
-                            // Formato: equate "STATION@CURRENT_SURVEY" "STATION@OTHER_SURVEY"
-                            // Nota: assumo che i nomi delle survey nel tdconfig abbiano il nome usato per l'upload (newName)
-                            // e che per l'altra survey si usi il nome originale o quello trovato nel file? 
-                            // Per ora uso junctionData.otherSurveyName come indicato dall'utente.
-                            lines.add(equateIndex, "    equate \"${junctionData.firstStation}@$newName\" \"${junctionData.secondStation}@${junctionData.otherSurveyName}\"")
                         }
+                        if (insertIndex != -1) {
+                            val color = (Math.random() * 16777215).toInt()
+                            lines.add(insertIndex, "    load \"$newName\" -color $color")
+                            if (junctionData != null) {
+                                var equateIndex = lines.size - 1
+                                for (i in lines.indices.reversed()) if (lines[i].trim() == "endsurvey") {
+                                    equateIndex = i; break
+                                }
+                                lines.add(
+                                    equateIndex,
+                                    "    equate \"${junctionData.firstStation}@$newName\" \"${junctionData.secondStation}@${junctionData.otherSurveyName}\""
+                                )
+                            }
+                            val updatedTdContent = lines.joinToString("\n")
+                            val tempTdFile = JFile(
+                                context.cacheDir,
+                                nextName
+                            ).apply { writeText(updatedTdContent) }
 
-                        val updatedTdContent = lines.joinToString("\n")
-                        val tempTdFile = JFile(context.cacheDir, tdFile.name)
-                        tempTdFile.writeText(updatedTdContent)
-                        
-                        val tdMedia = com.google.api.client.http.FileContent("application/octet-stream", tempTdFile)
-                        
-                        // Invece di update, eliminiamo e ricreiamo per essere "proprietari" del file sotto DRIVE_FILE scope
-                        try {
-                            drive.files().delete(tdFile.id).execute()
-                        } catch (e: Exception) {
-                            withContext(Dispatchers.Main) { onLog("WARNING: Duplicate ${tdFile.name} remains! Manual delete suggested.", Color.Yellow) }
+                            val meta =
+                                File().apply { setName(nextName); setParents(listOf(projectsFolderId)) }
+                            drive.files().create(
+                                meta,
+                                com.google.api.client.http.FileContent(
+                                    "application/octet-stream",
+                                    tempTdFile
+                                )
+                            ).execute()
+                            tempTdFile.delete()
+
+                            // Aggiorna il riferimento nel JSON
+                            caveJsonObject.put("projectFile", nextPath)
+
+                            withContext(Dispatchers.Main) {
+                                onLog(
+                                    "Created version $nextName",
+                                    Color.Green
+                                )
+                            }
                         }
-                        
-                        val meta = File().apply { name = tdFile.name; parents = listOf(folderId) }
-                        drive.files().create(meta, tdMedia).execute()
-
-                        tempTdFile.delete()
-                        withContext(Dispatchers.Main) { onLog("Updated ${tdFile.name}", Color.Green) }
-                    } else {
-                        withContext(Dispatchers.Main) { onLog("ERROR: Could not find insertion point in ${tdFile.name}", Color.Red) }
                     }
-                } else {
-                    withContext(Dispatchers.Main) { onLog("${tdFile.name} already contains this survey.", Color.Gray) }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        onLog(
+                            "ERROR updating project: ${e.localizedMessage}",
+                            Color.Red
+                        )
+                    }
                 }
-            } catch (e: Exception) {
-                val errMsg = e.localizedMessage ?: e.toString()
-                withContext(Dispatchers.Main) { onLog("ERROR updating ${tdFile.name}: $errMsg", Color.Red) }
             }
         }
 
-        tempSrcDb.delete()
-        uploadSqliteFile.delete()
-        jsonFile.delete()
-        
-        withContext(Dispatchers.Main) { onLog("Upload completed successfully!", Color.Green) }
-    } catch (e: Exception) {
-        val errorMessage = when {
-            e is com.google.api.client.googleapis.json.GoogleJsonResponseException -> {
+        // Aggiorna l'array projectFiles nel JSON (rimosso vecchio metodo)
+            val jsonFile =
+                JFile(context.cacheDir, nextName).apply { writeText(caveJsonObject.toString(3)) }
+            val meta = File().apply { setName(nextName); setParents(listOf(folderId)) }
+            drive.files()
+                .create(meta, com.google.api.client.http.FileContent("application/json", jsonFile))
+                .execute()
+
+            tempSrcDb.delete(); uploadSqliteFile.delete(); jsonFile.delete()
+            withContext(Dispatchers.Main) {
+                onLog(
+                    "Upload completed: version $nextName created.",
+                    Color.Green
+                )
+            }
+
+            withContext(Dispatchers.Main) { onLog("Upload completed successfully!", Color.Green) }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            val msg = if (e is GoogleJsonResponseException) {
                 "Drive Error: ${e.details?.message ?: e.message}"
+            } else {
+                e.message ?: e.toString()
             }
-            e.message == null -> e.toString()
-            else -> e.message
+            withContext(Dispatchers.Main) { onLog("Upload ERROR: $msg", Color.Red) }
         }
-        withContext(Dispatchers.Main) { onLog("Upload ERROR: $errorMessage", Color.Red) }
-        e.printStackTrace()
-    }
 }
 
-suspend fun loadSettings(context: Context, folderUri: Uri): List<ArchiveConfig> = withContext(Dispatchers.IO) {
-    try {
-        val parent = DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext emptyList()
-        val dbFile = parent.findFile("distox14.sqlite") ?: return@withContext emptyList()
-        
-        val tempDb = JFile(context.cacheDir, "load_settings_temp.sqlite")
-        context.contentResolver.openInputStream(dbFile.uri)?.use { input ->
-            FileOutputStream(tempDb).use { output -> input.copyTo(output) }
-        }
-        
-        val result = mutableListOf<ArchiveConfig>()
-        SQLiteDatabase.openDatabase(tempDb.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { db ->
-            ensureCaveArchiveColumn(db)
-            db.query("CA_Archives", null, null, null, null, null, null).use { cursor ->
-                while (cursor.moveToNext()) {
-                    result.add(ArchiveConfig(
-                        id = cursor.getInt(cursor.getColumnIndexOrThrow("id")),
-                        name = cursor.getString(cursor.getColumnIndexOrThrow("name")),
-                        url = cursor.getString(cursor.getColumnIndexOrThrow("url"))
-                    ))
-                }
-            }
-        }
-        tempDb.delete()
-        result
-    } catch (e: Exception) {
-        emptyList()
-    }
-}
-
-suspend fun saveSettings(context: Context, folderUri: Uri, archives: List<ArchiveConfig>) = withContext(Dispatchers.IO) {
-    try {
-        val parent = DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext
-        val dbFile = parent.findFile("distox14.sqlite") ?: return@withContext
-        
-        val tempDb = JFile(context.cacheDir, "save_settings_temp.sqlite")
-        context.contentResolver.openInputStream(dbFile.uri)?.use { input ->
-            FileOutputStream(tempDb).use { output -> input.copyTo(output) }
-        }
-        
-        SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
-            ensureCaveArchiveColumn(db)
-            db.beginTransaction()
+suspend fun loadSettings(context: Context, folderUri: Uri): List<ArchiveConfig> {
+        return withContext(Dispatchers.IO) {
             try {
-                db.delete("CA_Archives", null, null)
-                for (archive in archives) {
-                    val values = ContentValues().apply {
-                        put("name", archive.name)
-                        put("url", archive.url)
-                        if (archive.id > 0) put("id", archive.id)
-                    }
-                    db.insert("CA_Archives", null, values)
+                val parent =
+                    DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext emptyList()
+                val dbFile = parent.findFile("distox14.sqlite") ?: return@withContext emptyList()
+
+                val tempDb = JFile(context.cacheDir, "load_settings_temp.sqlite")
+                context.contentResolver.openInputStream(dbFile.uri)?.use { input ->
+                    FileOutputStream(tempDb).use { output -> input.copyTo(output) }
                 }
-                db.setTransactionSuccessful()
-            } finally {
-                db.endTransaction()
+
+                val result = mutableListOf<ArchiveConfig>()
+                SQLiteDatabase.openDatabase(tempDb.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
+                    .use { db ->
+                        ensureCaveArchiveColumn(db)
+                        db.query("CA_Archives", null, null, null, null, null, null).use { cursor ->
+                            while (cursor.moveToNext()) {
+                                result.add(
+                                    ArchiveConfig(
+                                        id = cursor.getInt(cursor.getColumnIndexOrThrow("id")),
+                                        name = cursor.getString(cursor.getColumnIndexOrThrow("name")),
+                                        url = cursor.getString(cursor.getColumnIndexOrThrow("url"))
+                                    )
+                                )
+                            }
+                        }
+                    }
+                tempDb.delete()
+                result
+            } catch (e: Exception) {
+                e.printStackTrace()
+                emptyList()
             }
         }
-        
-        context.contentResolver.openOutputStream(dbFile.uri, "wt")?.use { output ->
-            tempDb.inputStream().use { input -> input.copyTo(output) }
-            output.flush()
-        }
-        tempDb.delete()
-    } catch (e: Exception) {
-        e.printStackTrace()
     }
-}
+
+fun saveSettings(context: Context, folderUri: Uri, archives: List<ArchiveConfig>) =
+        runBlocking<Unit> { saveSettingsSuspend(context, folderUri, archives) }
+
+suspend fun saveSettingsSuspend(context: Context, folderUri: Uri, archives: List<ArchiveConfig>) =
+        withContext(Dispatchers.IO) {
+            try {
+                val parent = DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext
+                val dbFile = parent.findFile("distox14.sqlite") ?: return@withContext
+
+                val tempDb = JFile(context.cacheDir, "save_settings_temp.sqlite")
+                context.contentResolver.openInputStream(dbFile.uri)?.use { input ->
+                    FileOutputStream(tempDb).use { output -> input.copyTo(output) }
+                }
+
+                SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
+                    ensureCaveArchiveColumn(db)
+                    db.beginTransaction()
+                    try {
+                        db.delete("CA_Archives", null, null)
+                        for (archive in archives) {
+                            val values = ContentValues().apply {
+                                put("name", archive.name)
+                                put("url", archive.url)
+                                if (archive.id > 0) put("id", archive.id)
+                            }
+                            val newId = db.insert("CA_Archives", null, values)
+                            // Log internally or via a way to see it
+                        }
+                        db.setTransactionSuccessful()
+                    } finally {
+                        db.endTransaction()
+                    }
+                }
+
+                context.contentResolver.openOutputStream(dbFile.uri, "wt")?.use { output ->
+                    tempDb.inputStream().use { input -> input.copyTo(output) }
+                    output.flush()
+                }
+                tempDb.delete()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
 
 suspend fun wipeManagedData(
-    context: Context,
-    localFolderUri: Uri,
-    archiveId: Int? = null,
-    onLog: (String, Color) -> Unit
-): Pair<Boolean, String> = withContext(Dispatchers.IO) {
-    try {
-        val parentFolder = DocumentFile.fromTreeUri(context, localFolderUri) ?: return@withContext false to "Local folder error"
-        val dbDocFile = parentFolder.findFile("distox14.sqlite") ?: return@withContext false to "distox14.sqlite not found"
-
-        val tempDb = JFile(context.cacheDir, "temp_wipe_${System.currentTimeMillis()}.sqlite")
+        context: Context,
+        localFolderUri: Uri,
+        archiveId: Int? = null,
+        onLog: (String, Color) -> Unit
+    ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
         try {
+            val parentFolder = DocumentFile.fromTreeUri(context, localFolderUri)
+                ?: return@withContext false to "Local folder error"
+            val dbDocFile = parentFolder.findFile("distox14.sqlite")
+                ?: return@withContext false to "distox14.sqlite not found"
+
+            val tempDb = JFile(context.cacheDir, "temp_wipe_${System.currentTimeMillis()}.sqlite")
+            try {
+                context.contentResolver.openInputStream(dbDocFile.uri)?.use { input ->
+                    FileOutputStream(tempDb).use { output -> input.copyTo(output) }
+                }
+
+                SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
+                    db.beginTransaction()
+                    try {
+                        ensureCaveArchiveColumn(db)
+                        val whereClause =
+                            if (archiveId == null) "archiveId > 0" else "archiveId = ?"
+                        val whereArgs =
+                            if (archiveId == null) null else arrayOf(archiveId.toString())
+
+                        // Log identifying what we are wiping
+                        withContext(Dispatchers.Main) {
+                            onLog(
+                                "Wiping database data (Archive: ${archiveId ?: "ALL"})...",
+                                Color.Cyan
+                            )
+                        }
+
+                        val fixedDeleted = db.delete("fixeds", whereClause, whereArgs)
+                        val shotsDeleted = db.delete("shots", whereClause, whereArgs)
+                        val surveysDeleted = db.delete("surveys", whereClause, whereArgs)
+
+                        // Backup wipe: delete by name if they are in CA_Surveys but weren't caught by archiveId ID
+                        var extraDeleted = 0
+                        db.query(
+                            "CA_Surveys",
+                            arrayOf("file_name"),
+                            if (archiveId == null) null else "archiveId = ?",
+                            whereArgs,
+                            null,
+                            null,
+                            null
+                        ).use { cursor ->
+                            while (cursor.moveToNext()) {
+                                val fileName = cursor.getString(0).removeSuffix(".sqlite")
+                                extraDeleted += db.delete(
+                                    "surveys",
+                                    "name = ? AND archiveId = 0",
+                                    arrayOf(fileName)
+                                )
+                                // Se abbiamo cancellato la survey, dobbiamo pulire anche i suoi orfani
+                                db.execSQL("DELETE FROM shots WHERE surveyId NOT IN (SELECT id FROM surveys)")
+                                db.execSQL("DELETE FROM fixeds WHERE surveyId NOT IN (SELECT id FROM surveys)")
+                            }
+                        }
+
+                        // Clear synched surveys metadata
+                        db.delete(
+                            "CA_Surveys",
+                            if (archiveId == null) null else "archiveId = ?",
+                            whereArgs
+                        )
+
+                        // Delete physical supporting files before clearing the table
+                        val parent = DocumentFile.fromTreeUri(context, localFolderUri)
+                        var deletedFilesCount = 0
+                        db.query(
+                            "CA_Files",
+                            arrayOf("path"),
+                            if (archiveId == null) null else "archiveId = ?",
+                            whereArgs,
+                            null,
+                            null,
+                            null
+                        ).use { cursor ->
+                            while (cursor.moveToNext()) {
+                                val cloudPath = cursor.getString(0) // es: "projects/nome.tdconfig"
+                                val parts = cloudPath.split("/")
+                                if (parts.size == 2) {
+                                    // Mappa il nome della cartella cloud alla cartella locale di TopoDroid
+                                    val localDirName = when (parts[0]) {
+                                        "projects" -> "thconfig"
+                                        "DEMs" -> "DTM"
+                                        else -> parts[0]
+                                    }
+                                    parent?.findFile(localDirName)?.findFile(parts[1])?.delete()
+                                    deletedFilesCount++
+                                }
+                            }
+                        }
+                        db.delete(
+                            "CA_Files",
+                            if (archiveId == null) null else "archiveId = ?",
+                            whereArgs
+                        )
+
+                        db.setTransactionSuccessful()
+
+                        withContext(Dispatchers.Main) {
+                            onLog("Deleted $deletedFilesCount supporting files.", Color.Yellow)
+                            onLog(
+                                "Deleted $surveysDeleted surveys, $shotsDeleted shots and $fixedDeleted fixed points.",
+                                Color.Yellow
+                            )
+                        }
+
+                        // Delete OLD JSONs if they exist (only for full wipe)
+                        if (archiveId == null) {
+                            val archiveFolder = parent?.findFile("CaveArchive")
+                            archiveFolder?.findFile("CaveArchive_files.json")?.delete()
+                            archiveFolder?.findFile("CaveArchive_synched_caves.json")?.delete()
+                        }
+                    } finally {
+                        if (db.inTransaction()) db.endTransaction()
+                    }
+                }
+
+                context.contentResolver.openOutputStream(dbDocFile.uri, "wt")?.use { output ->
+                    tempDb.inputStream().use { input -> input.copyTo(output) }
+                    output.flush()
+                }
+                return@withContext true to "Wipe completed successfully."
+            } finally {
+                if (tempDb.exists()) tempDb.delete()
+            }
+        } catch (e: Exception) {
+            return@withContext false to "Wipe error: ${e.localizedMessage}"
+        }
+    }
+
+fun getDisplayName(uri: Uri): String = uri.path?.split(":")?.lastOrNull() ?: uri.toString()
+
+fun ensureCaveArchiveColumn(db: SQLiteDatabase) {
+        val tables = listOf("surveys", "shots", "fixeds")
+        for (table in tables) {
+            try {
+                val cursor = db.rawQuery("SELECT * FROM $table LIMIT 0", null)
+                val hasOld = cursor.getColumnIndex("caveArchive") != -1
+                val hasNew = cursor.getColumnIndex("archiveId") != -1
+                cursor.close()
+
+                if (hasOld && !hasNew) {
+                    // Migrate from caveArchive to archiveId
+                    db.execSQL("ALTER TABLE $table ADD COLUMN archiveId INTEGER DEFAULT 0")
+                    db.execSQL("UPDATE $table SET archiveId = caveArchive")
+                } else if (!hasNew) {
+                    db.execSQL("ALTER TABLE $table ADD COLUMN archiveId INTEGER DEFAULT 0")
+                }
+            } catch (e: Exception) {
+                // Table might not exist yet in TopoDroid DB if it's very old or corrupted
+            }
+        }
+        db.execSQL("CREATE TABLE IF NOT EXISTS CA_Archives (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT)")
+        db.execSQL("CREATE TABLE IF NOT EXISTS CA_Surveys (id INTEGER PRIMARY KEY AUTOINCREMENT, archiveId INTEGER, file_name TEXT, drive_id TEXT, modified_time TEXT)")
+        db.execSQL("CREATE TABLE IF NOT EXISTS CA_Files (id INTEGER PRIMARY KEY AUTOINCREMENT, archiveId INTEGER, path TEXT, drive_id TEXT, modified_time TEXT)")
+    }
+
+suspend fun migrateJsonToDb(context: Context, folderUri: Uri) = withContext(Dispatchers.IO) {
+        try {
+            val parent = DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext
+            val archiveFolder = parent.findFile("CaveArchive") ?: return@withContext
+            val dbFile = parent.findFile("distox14.sqlite") ?: return@withContext
+
+            // Migrate Archives (Settings)
+            val settingsFile = archiveFolder.findFile("CaveArchive_Settings.json")
+            if (settingsFile != null) {
+                val current = loadSettings(context, folderUri)
+                if (current.isEmpty()) {
+                    val jsonStr = context.contentResolver.openInputStream(settingsFile.uri)
+                        ?.use { it.bufferedReader().readText() } ?: ""
+                    val array = JSONObject(jsonStr).getJSONArray("archives")
+                    val toMigrate = List(array.length()) { i ->
+                        val obj = array.getJSONObject(i)
+                        ArchiveConfig(name = obj.getString("name"), url = obj.getString("url"))
+                    }
+                    if (toMigrate.isNotEmpty()) {
+                        saveSettings(context, folderUri, toMigrate)
+                    }
+                }
+            }
+
+            // Migrate Files Inventory
+            val inventoryFile = archiveFolder.findFile("CaveArchive_files.json")
+            if (inventoryFile != null) {
+                val tempDb = JFile(context.cacheDir, "migrate_files_temp.sqlite")
+                context.contentResolver.openInputStream(dbFile.uri)?.use { input ->
+                    FileOutputStream(tempDb).use { output -> input.copyTo(output) }
+                }
+
+                SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
+                    ensureCaveArchiveColumn(db)
+                    val count = db.rawQuery("SELECT COUNT(*) FROM CA_Files", null)
+                        .use { if (it.moveToFirst()) it.getInt(0) else 0 }
+                    if (count == 0) {
+                        val jsonStr = context.contentResolver.openInputStream(inventoryFile.uri)
+                            ?.use { it.bufferedReader().readText() } ?: ""
+                        val array = JSONObject(jsonStr).getJSONArray("downloaded_files")
+                        val archives = loadSettings(context, folderUri)
+                        if (archives.isNotEmpty()) {
+                            val firstArchiveId = archives.first().id
+                            db.beginTransaction()
+                            try {
+                                for (i in 0 until array.length()) {
+                                    val item = array.get(i)
+                                    val obj = if (item is JSONObject) item else null
+                                    if (obj != null) {
+                                        val values = ContentValues().apply {
+                                            put("archiveId", firstArchiveId)
+                                            put("path", obj.getString("path"))
+                                            put("drive_id", obj.getString("drive_id"))
+                                            put("modified_time", obj.getString("modified_time"))
+                                        }
+                                        db.insert("CA_Files", null, values)
+                                    }
+                                }
+                                db.setTransactionSuccessful()
+                            } finally {
+                                db.endTransaction()
+                            }
+                        }
+                    }
+                }
+                context.contentResolver.openOutputStream(dbFile.uri, "wt")?.use { output ->
+                    tempDb.inputStream().use { input -> input.copyTo(output) }
+                    output.flush()
+                }
+               tempDb.delete()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+suspend fun syncDriveFolderOAuth(
+        context: Context,
+        archive: ArchiveConfig,
+        localFolderUri: Uri,
+        onLog: (String, Color) -> Unit,
+        onProgressLog: (String, Color) -> Unit,
+        checkCancelled: () -> Boolean
+    ): Pair<Boolean, String> {
+        return withContext(Dispatchers.IO) {
+        suspend fun safeLog(text: String, color: Color = Color.White) =
+            withContext(Dispatchers.Main) { onLog(text, color) }
+
+        suspend fun safeUpdateLog(text: String, color: Color = Color.White) =
+            withContext(Dispatchers.Main) { onProgressLog(text, color) }
+
+        suspend fun <T> runWithRetry(name: String, block: () -> T): T {
+            var lastEx: Throwable? = null
+            var currentDelay = 2000L
+            for (i in 1..3) {
+                if (checkCancelled()) throw kotlinx.coroutines.CancellationException()
+
+                try {
+                    return withTimeout(180000) { // Increased to 3 minutes
+                        kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
+                            block()
+                        }
+                    }
+                } catch (t: Throwable) {
+                    if (t is kotlinx.coroutines.CancellationException && t !is kotlinx.coroutines.TimeoutCancellationException) {
+                        throw t
+                    }
+
+                    lastEx = t
+                    if (i < 3) {
+                        val errorDetail = t.localizedMessage ?: "Timeout or Network error"
+                        safeLog("Retry $i/3: $name ($errorDetail)", Color.Yellow)
+                        delay(currentDelay)
+                        currentDelay *= 2 // Exponential backoff
+                    } else {
+                        safeLog("Failed after 3 attempts: $name", Color.Red)
+                    }
+                }
+            }
+            throw lastEx ?: Exception("Task $name failed after multiple attempts")
+        }
+
+        // Helper to download stream with progress reporting
+        suspend fun downloadFileWithProgress(
+            drive: Drive,
+            driveFileId: String,
+            fileName: String,
+            outputStream: java.io.OutputStream
+        ) {
+            val fileMeta = drive.files().get(driveFileId).setFields("size").execute()
+            val totalSize = fileMeta.getSize() ?: -1L
+            var totalRead = 0L
+
+            safeLog("Downloading $fileName...", Color.Gray)
+
+            val inputStream = drive.files().get(driveFileId).executeMediaAsInputStream()
+            inputStream.use { input ->
+                outputStream.use { output ->
+                    val buffer = ByteArray(8192)
+                    var bytesRead: Int
+                    var lastPct = -1
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        if (checkCancelled()) throw kotlinx.coroutines.CancellationException()
+                        output.write(buffer, 0, bytesRead)
+                        totalRead += bytesRead
+                        if (totalSize > 0) {
+                            val pct = (totalRead * 100 / totalSize).toInt()
+                            if (pct != lastPct) {
+                                safeUpdateLog("Downloading $fileName... $pct%", Color.Gray)
+                                lastPct = pct
+                            }
+                        }
+                    }
+                    output.flush()
+                }
+            }
+        }
+
+        try {
+            val account = GoogleSignIn.getLastSignedInAccount(context)
+                ?: return@withContext false to "Please Login to Google"
+            val credential = GoogleAccountCredential.usingOAuth2(
+                context,
+                Collections.singleton(DriveScopes.DRIVE_READONLY)
+            ).apply { selectedAccount = account.account }
+            val drive = Drive.Builder(
+                AndroidHttp.newCompatibleTransport(),
+                GsonFactory.getDefaultInstance(),
+                credential
+            ).setApplicationName("CaveArchive").build()
+
+            val folderId =
+                if (archive.url.contains("/folders/")) archive.url.split("/folders/").getOrNull(1)
+                    ?.split("?")?.getOrNull(0)
+                else if (archive.url.contains("id=")) archive.url.split("id=").getOrNull(1)
+                    ?.split("&")?.getOrNull(0)
+                else null
+            if (folderId == null) return@withContext false to "Invalid URL"
+
+            safeLog("Connecting to Drive...", Color.Cyan)
+            val rootFiles = runWithRetry("file list") {
+                drive.files().list().setQ("'$folderId' in parents and trashed = false")
+                    .setFields("files(id, name)").execute()
+            }.files ?: emptyList()
+
+            // 1. Trova l'ultimo cavesXXXXX.json
+            val cavesJsonPattern = Regex("caves([0-9a-fA-F]{5})\\.json")
+            val latestCavesFile = rootFiles.mapNotNull { f ->
+                val match = cavesJsonPattern.matchEntire(f.name)
+                if (match != null) f to match.groupValues[1].toInt(16) else null
+            }.maxByOrNull { it.second }?.first
+                ?: return@withContext false to "cavesXXXXX.json not found"
+
+            safeLog("Using config: ${latestCavesFile.name}", Color.Green)
+            val jsonStr = runWithRetry("download ${latestCavesFile.name}") {
+                drive.files().get(latestCavesFile.id).executeMediaAsInputStream().bufferedReader()
+                    .use { it.readText() }
+            }
+            val caveJsonObject = JSONObject(jsonStr)
+            val caves = caveJsonObject.getJSONArray("caves")
+
+            // Ottieni gli ID delle cartelle sottostanti per il download
+            val cavesFolderId = rootFiles.find { it.name.equals("caves", true) }?.id
+
+            if (cavesFolderId == null) safeLog("WARNING: 'caves' folder not found.", Color.Yellow)
+
+            val parentFolder = DocumentFile.fromTreeUri(context, localFolderUri)
+                ?: return@withContext false to "Local folder error"
+            val dbDocFile = parentFolder.findFile("distox14.sqlite")
+
+            var updatedCavesCount = 0
+
+            // --- LOGICA SINCRONIZZAZIONE DB ---
+            if (dbDocFile != null) {
+                val suffix = System.currentTimeMillis()
+                val tempDb = JFile(context.cacheDir, "temp_distox14_$suffix.sqlite")
+                try {
+                    safeLog("Updating DB...", Color.Cyan)
+                    context.contentResolver.openInputStream(dbDocFile.uri)
+                        ?.use { input -> FileOutputStream(tempDb).use { input.copyTo(it) } }
+
+                    SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
+                        ensureCaveArchiveColumn(db)
+
+                        // Pre-carica i file nella cartella caves/ per velocizzare
+                        val remoteCaveFiles = if (cavesFolderId != null) drive.files().list()
+                            .setQ("'$cavesFolderId' in parents and trashed = false")
+                            .setFields("files(id, name, modifiedTime)").execute().files
+                            ?: emptyList() else emptyList()
+
+                        db.beginTransaction()
+                        try {
+                            for (i in 0 until caves.length()) {
+                                if (checkCancelled()) break
+                                val cave = caves.getJSONObject(i)
+                                val name = cave.getString("name")
+                                val sNameWithPath =
+                                    cave.getString("shotsFile") // es: "caves/Nome.sqlite"
+                                val sName = sNameWithPath.split("/").last()
+
+                                val vals = ContentValues().apply {
+                                    put("name", name); put(
+                                    "day",
+                                    cave.optString("day", "")
+                                ); put("team", cave.optString("team", ""))
+                                    put("comment", cave.optString("comment", "")); put(
+                                    "archiveId",
+                                    archive.id
+                                )
+                                    put("declination", cave.optDouble("declination", 0.0))
+                                    put(
+                                        "init_station",
+                                        cave.optString("init_station", "")
+                                    ); put("xsections", 0); put("datamode", 0)
+                                    put("extend", 0); put("created", 0); put("immutable", 0)
+                                }
+
+                                val sId = db.query(
+                                    "surveys",
+                                    arrayOf("id"),
+                                    "name = ?",
+                                    arrayOf(name),
+                                    null,
+                                    null,
+                                    null
+                                ).use { c ->
+                                    if (cursorToFirst(c)) {
+                                        db.update(
+                                            "surveys",
+                                            vals,
+                                            "name = ?",
+                                            arrayOf(name)
+                                        ); c.getInt(0)
+                                    } else {
+                                        val next = db.rawQuery("SELECT MAX(id) FROM surveys", null)
+                                            .use { if (cursorToFirst(it)) it.getInt(0) + 1 else 1 }
+                                        vals.put("id", next); db.insert("surveys", null, vals); next
+                                    }
+                                }
+
+                                if (cave.has("fixeds")) {
+                                    val f = cave.getJSONObject("fixeds")
+                                    val fv = ContentValues().apply {
+                                        put("surveyId", sId); put(
+                                        "station",
+                                        f.optString("station", "")
+                                    )
+                                        put(
+                                            "longitude",
+                                            f.optDouble("longitude", 0.0)
+                                        ); put("latitude", f.optDouble("latitude", 0.0))
+                                        put(
+                                            "altitude",
+                                            f.optDouble("altitude", 0.0)
+                                        ); put("altimetric", f.optDouble("altimetric", 0.0))
+                                        put("comment", ""); put(
+                                        "archiveId",
+                                        archive.id
+                                    ); put("status", 0); put("cs_name", ""); put(
+                                        "cs_longitude",
+                                        0.0
+                                    ); put("cs_latitude", 0.0); put(
+                                        "cs_altitude",
+                                        0.0
+                                    ); put("source", 2); put("cs_decimals", 2); put(
+                                        "convergence",
+                                        0.0
+                                    )
+                                    }
+                                    db.query(
+                                        "fixeds",
+                                        arrayOf("id"),
+                                        "surveyId = ?",
+                                        arrayOf(sId.toString()),
+                                        null,
+                                        null,
+                                        null
+                                    ).use { c ->
+                                        if (cursorToFirst(c)) db.update(
+                                            "fixeds",
+                                            fv,
+                                            "surveyId = ?",
+                                            arrayOf(sId.toString())
+                                        )
+                                        else {
+                                            fv.put("id", 1); db.insert("fixeds", null, fv)
+                                        }
+                                    }
+                                }
+
+                                val sFile = remoteCaveFiles.find { it.name == sName }
+                                if (sFile != null) {
+                                    val currentModifiedTime = sFile.modifiedTime?.toString() ?: ""
+                                    // Check metadata
+                                    var needsUpdate = true
+                                    db.query(
+                                        "CA_Surveys",
+                                        arrayOf("modified_time"),
+                                        "archiveId = ? AND file_name = ?",
+                                        arrayOf(archive.id.toString(), sName),
+                                        null,
+                                        null,
+                                        null
+                                    ).use { mc ->
+                                        if (mc.moveToFirst() && mc.getString(0) == currentModifiedTime) needsUpdate =
+                                            false
+                                    }
+
+                                    if (!needsUpdate) {
+                                        safeLog("$sName is up to date.", Color.Gray)
+                                    } else {
+                                        val tShots = JFile(context.cacheDir, "temp_shots.sqlite")
+                                        runWithRetry("download $sName") {
+                                            context.contentResolver.openOutputStream(
+                                                Uri.fromFile(
+                                                    tShots
+                                                )
+                                            )?.use { out ->
+                                                kotlinx.coroutines.runBlocking {
+                                                    downloadFileWithProgress(
+                                                        drive,
+                                                        sFile.id,
+                                                        sName,
+                                                        out
+                                                    )
+                                                }
+                                            }
+                                        }
+
+                                        val metaVals = ContentValues().apply {
+                                            put(
+                                                "archiveId",
+                                                archive.id
+                                            ); put("file_name", sName); put(
+                                            "drive_id",
+                                            sFile.id
+                                        ); put("modified_time", currentModifiedTime)
+                                        }
+                                        if (db.update(
+                                                "CA_Surveys",
+                                                metaVals,
+                                                "archiveId = ? AND file_name = ?",
+                                                arrayOf(archive.id.toString(), sName)
+                                            ) == 0
+                                        ) db.insert("CA_Surveys", null, metaVals)
+
+                                        SQLiteDatabase.openDatabase(
+                                            tShots.absolutePath,
+                                            null,
+                                            SQLiteDatabase.OPEN_READONLY
+                                        ).use { sDb ->
+                                            db.delete(
+                                                "shots",
+                                                "surveyId = ?",
+                                                arrayOf(sId.toString())
+                                            )
+                                            sDb.query("shots", null, null, null, null, null, null)
+                                                .use { sc ->
+                                                    if (cursorToFirst(sc)) do {
+                                                        val row = ContentValues()
+                                                        for (col in sc.columnNames) {
+                                                            if (col == "caveArchive") continue // Skip old column name
+                                                            val idx = sc.getColumnIndex(col)
+                                                            when (sc.getType(idx)) {
+                                                                Cursor.FIELD_TYPE_INTEGER -> row.put(
+                                                                    col,
+                                                                    sc.getLong(idx)
+                                                                )
+
+                                                                Cursor.FIELD_TYPE_FLOAT -> row.put(
+                                                                    col,
+                                                                    sc.getDouble(idx)
+                                                                )
+
+                                                                Cursor.FIELD_TYPE_STRING -> row.put(
+                                                                    col,
+                                                                    sc.getString(idx)
+                                                                )
+
+                                                                Cursor.FIELD_TYPE_BLOB -> row.put(
+                                                                    col,
+                                                                    sc.getBlob(idx)
+                                                                )
+
+                                                                else -> row.putNull(col)
+                                                            }
+                                                        }
+                                                        row.put(
+                                                            "archiveId",
+                                                            archive.id
+                                                        ); row.put("surveyId", sId)
+                                                        db.insertWithOnConflict(
+                                                            "shots",
+                                                            null,
+                                                            row,
+                                                            SQLiteDatabase.CONFLICT_REPLACE
+                                                        )
+                                                    } while (sc.moveToNext())
+                                                }
+                                        }
+                                        tShots.delete(); updatedCavesCount++
+                                    }
+                                } else {
+                                    safeLog("ERROR: Shots file '$sName' not found in Drive caves/ folder!", Color.Red)
+                                }
+                            }
+                            if (!checkCancelled()) db.setTransactionSuccessful()
+                        } finally {
+                            if (db.inTransaction()) db.endTransaction()
+                        }
+                    }
+                    if (!checkCancelled()) {
+                        withContext(kotlinx.coroutines.NonCancellable) {
+                            context.contentResolver.openOutputStream(dbDocFile.uri, "wt")
+                                ?.use { out ->
+                                    tempDb.inputStream().use { it.copyTo(out) }; out.flush()
+                                }
+                            safeLog(
+                                "DB updated: $updatedCavesCount surveys processed.",
+                                Color.Green
+                            )
+                        }
+                    }
+                } catch (e: Exception) {
+                    safeLog("DB Error: ${e.localizedMessage}", Color.Red)
+                } finally {
+                    tempDb.delete()
+                }
+            }
+
+            // --- LOGICA SINCRONIZZAZIONE FILE (DEMs e Projects) ---
+            suspend fun syncFilesList(
+                jsonArray: JSONArray,
+                localDirName: String
+            ) {
+                // Pattern per file versionati (es: Progetto00001.tdconfig)
+                val versionPattern = Regex("(.+?)([0-9a-fA-F]{5})\\.(tdconfig|asc|asci|ascii)")
+
+                for (j in 0 until jsonArray.length()) {
+                    if (checkCancelled()) break
+                    val fullPath = jsonArray.getString(j) // es: "project/nome00001.tdconfig"
+                    val parts = fullPath.split("/")
+                    if (parts.size != 2) {
+                        safeLog("ERROR: Invalid file path in JSON: $fullPath", Color.Red)
+                        continue
+                    }
+
+                    val remoteDirName = parts[0]
+                    val fileNameWithExt = parts[1]
+
+                    // Trova l'ID della cartella remota specificata nel percorso (es: "project")
+                    val remoteFolderId = rootFiles.find { it.name.equals(remoteDirName, true) }?.id
+                    if (remoteFolderId == null) {
+                        safeLog("ERROR: Drive folder '$remoteDirName' not found!", Color.Red)
+                        continue
+                    }
+
+                    // Recupera la lista file di quella specifica cartella
+                    val remoteFiles = drive.files().list()
+                        .setQ("'$remoteFolderId' in parents and trashed = false")
+                        .setFields("files(id, name, modifiedTime)").execute().files ?: emptyList()
+
+                    // Estrai il nome base senza versione ed estensione
+                    val baseMatch = versionPattern.matchEntire(fileNameWithExt)
+                    val baseName = baseMatch?.groupValues?.get(1) ?: fileNameWithExt.split(".").first()
+                    val ext = fileNameWithExt.split(".").last()
+
+                    // Cerca la versione più alta disponibile sul cloud per questo file base
+                    val latestRemoteFile = remoteFiles.filter { f ->
+                        val m = versionPattern.matchEntire(f.name)
+                        if (m != null) m.groupValues[1] == baseName && m.groupValues[3] == ext
+                        else f.name == fileNameWithExt || f.name == "$baseName.$ext"
+                    }.mapNotNull { f ->
+                        val m = versionPattern.matchEntire(f.name)
+                        if (m != null) f to m.groupValues[2].toInt(16) else f to 0
+                    }.maxByOrNull { it.second }?.first
+                        ?: remoteFiles.find { it.name == fileNameWithExt }
+
+                    if (latestRemoteFile != null) {
+                        val currentModifiedTime = latestRemoteFile.modifiedTime?.toString() ?: ""
+                        var needsUpdate = true
+
+                        // Controlla metadata locali in CA_Files
+                        val tempDbFile = JFile(context.cacheDir, "meta_check.sqlite")
+                        if (dbDocFile != null) {
+                            context.contentResolver.openInputStream(dbDocFile.uri)
+                                ?.use { input -> FileOutputStream(tempDbFile).use { input.copyTo(it) } }
+                            SQLiteDatabase.openDatabase(
+                                tempDbFile.absolutePath,
+                                null,
+                                SQLiteDatabase.OPEN_READONLY
+                            ).use { db ->
+                                ensureCaveArchiveColumn(db)
+                                db.query(
+                                    "CA_Files",
+                                    arrayOf("modified_time"),
+                                    "archiveId = ? AND path = ?",
+                                    arrayOf(archive.id.toString(), fullPath),
+                                    null,
+                                    null,
+                                    null
+                                ).use { cursor ->
+                                    if (cursor.moveToFirst() && cursor.getString(0) == currentModifiedTime) needsUpdate =
+                                        false
+                                }
+                            }
+                            tempDbFile.delete()
+                        }
+
+                        if (needsUpdate) {
+                            val destDir = parentFolder.findFile(localDirName) ?: parentFolder.createDirectory(localDirName)
+                            destDir?.let { d ->
+                                // Scarichiamo in un file temporaneo per analizzare il contenuto se è un tdconfig
+                                val tempDownloadFile = JFile(context.cacheDir, "temp_download_${System.currentTimeMillis()}")
+                                runWithRetry("download ${latestRemoteFile.name}") {
+                                    FileOutputStream(tempDownloadFile).use { out ->
+                                        kotlinx.coroutines.runBlocking {
+                                            downloadFileWithProgress(drive, latestRemoteFile.id, latestRemoteFile.name, out)
+                                        }
+                                    }
+                                }
+
+                                var localName = "$baseName.$ext"
+                                
+                                // Se è un file di progetto, cerchiamo il nome dentro il contenuto
+                                if (ext.equals("tdconfig", ignoreCase = true)) {
+                                    try {
+                                        val content = tempDownloadFile.readText(Charset.forName("UTF-8"))
+                                        val surveyMatch = Regex("""\bsurvey\s+"([^"]+)"""").find(content)
+                                        surveyMatch?.groupValues?.get(1)?.let { internalName ->
+                                            localName = "$internalName.tdconfig"
+                                            safeLog("Project renamed from content: $localName", Color.Gray)
+                                        }
+                                    } catch (e: Exception) {
+                                        safeLog("Warning: Could not parse tdconfig content.", Color.Yellow)
+                                    }
+                                }
+
+                                val target = d.findFile(localName) ?: d.createFile("application/octet-stream", localName)
+                                target?.let { t ->
+                                    context.contentResolver.openOutputStream(t.uri)?.use { out ->
+                                        tempDownloadFile.inputStream().use { it.copyTo(out) }
+                                    }
+                                    
+                                    updateFilesInventory(
+                                        context,
+                                        localFolderUri,
+                                        archive.id,
+                                        listOf(JSONObject().apply {
+                                            put("path", fullPath); put("drive_id", latestRemoteFile.id); put("modified_time", currentModifiedTime)
+                                        })
+                                    )
+                                }
+                                tempDownloadFile.delete()
+                            }
+                        } else {
+                            safeLog("${latestRemoteFile.name} is up to date.", Color.Gray)
+                        }
+                    } else {
+                        safeLog("ERROR: File '$fileNameWithExt' not found in Drive folder '$remoteDirName'!", Color.Red)
+                    }
+                }
+            }
+
+            // Gestione DEM e Progetti (se presenti nel JSON come stringhe singole)
+            val demFile = caveJsonObject.optString("demFile")
+            if (demFile.isNotEmpty()) {
+                syncFilesList(JSONArray().put(demFile), "DTM")
+            }
+            val projectFile = caveJsonObject.optString("projectFile")
+            if (projectFile.isNotEmpty()) {
+                syncFilesList(JSONArray().put(projectFile), "thconfig")
+            }
+
+            return@withContext true to (if (checkCancelled()) "Interrupted." else "Sync completed successfully.")
+        } catch (t: Throwable) {
+            return@withContext false to "Error: ${t.localizedMessage}"
+        }
+    }
+}
+
+fun cursorToFirst(c: Cursor?): Boolean = c?.moveToFirst() ?: false
+
+fun updateFilesInventory(
+        context: Context,
+        folderUri: Uri,
+        archiveId: Int,
+        newItems: List<JSONObject>
+    ) = runBlocking<Unit> { updateFilesInventorySuspend(context, folderUri, archiveId, newItems) }
+
+suspend fun updateFilesInventorySuspend(
+        context: Context,
+        folderUri: Uri,
+        archiveId: Int,
+        newItems: List<JSONObject>
+    ) {
+        withContext(Dispatchers.IO) {
+        try {
+            val parent = DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext
+            val dbDocFile = parent.findFile("distox14.sqlite") ?: return@withContext
+
+            val tempDb = JFile(context.cacheDir, "update_files_temp.sqlite")
             context.contentResolver.openInputStream(dbDocFile.uri)?.use { input ->
                 FileOutputStream(tempDb).use { output -> input.copyTo(output) }
             }
 
             SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
+                ensureCaveArchiveColumn(db)
                 db.beginTransaction()
                 try {
-                    ensureCaveArchiveColumn(db)
-                    val whereClause = if (archiveId == null) "caveArchive > 0" else "caveArchive = ?"
-                    val whereArgs = if (archiveId == null) null else arrayOf(archiveId.toString())
-
-                    val fixedDeleted = db.delete("fixeds", whereClause, whereArgs)
-                    val shotsDeleted = db.delete("shots", whereClause, whereArgs)
-                    val surveysDeleted = db.delete("surveys", whereClause, whereArgs)
-                    
-                    // Clear synched surveys metadata
-                    db.delete("CA_Surveys", if (archiveId == null) null else "archiveId = ?", whereArgs)
-                    
-                    // Delete physical supporting files before clearing the table
-                    val parent = DocumentFile.fromTreeUri(context, localFolderUri)
-                    var deletedFilesCount = 0
-                    db.query("CA_Files", arrayOf("path"), if (archiveId == null) null else "archiveId = ?", whereArgs, null, null, null).use { cursor ->
-                        while (cursor.moveToNext()) {
-                            val path = cursor.getString(0)
-                            val parts = path.split("/")
-                            if (parts.size == 2) {
-                                parent?.findFile(parts[0])?.findFile(parts[1])?.delete()
-                                deletedFilesCount++
-                            }
+                    newItems.forEach { newItem ->
+                        val path = newItem.getString("path")
+                        val vals = ContentValues().apply {
+                            put("archiveId", archiveId)
+                            put("path", path)
+                            put("drive_id", newItem.getString("drive_id"))
+                            put("modified_time", newItem.getString("modified_time"))
                         }
+
+                        val existingIdCursor = db.query(
+                            "CA_Files",
+                            arrayOf("id"),
+                            "archiveId = ? AND path = ?",
+                            arrayOf(archiveId.toString(), path),
+                            null,
+                            null,
+                            null
+                        )
+                        if (existingIdCursor.moveToFirst()) {
+                            db.update(
+                                "CA_Files",
+                                vals,
+                                "id = ?",
+                                arrayOf(existingIdCursor.getInt(0).toString())
+                            )
+                        } else {
+                            db.insert("CA_Files", null, vals)
+                        }
+                        existingIdCursor.close()
                     }
-                    db.delete("CA_Files", if (archiveId == null) null else "archiveId = ?", whereArgs)
-                    
                     db.setTransactionSuccessful()
-                    
-                    withContext(Dispatchers.Main) {
-                        onLog("Deleted $deletedFilesCount supporting files.", Color.Yellow)
-                    }
-
-                    // Delete OLD JSONs if they exist (only for full wipe)
-                    if (archiveId == null) {
-                        val archiveFolder = parent?.findFile("CaveArchive")
-                        archiveFolder?.findFile("CaveArchive_files.json")?.delete()
-                        archiveFolder?.findFile("CaveArchive_synched_caves.json")?.delete()
-                    }
-
-                    withContext(Dispatchers.Main) {
-                        onLog("Deleted $surveysDeleted surveys, $shotsDeleted shots and $fixedDeleted fixed points.", Color.Yellow)
-                    }
                 } finally {
-                    if (db.inTransaction()) db.endTransaction()
+                    db.endTransaction()
                 }
             }
 
@@ -1530,460 +2491,15 @@ suspend fun wipeManagedData(
                 tempDb.inputStream().use { input -> input.copyTo(output) }
                 output.flush()
             }
-            return@withContext true to "Wipe completed successfully."
-        } finally {
-            if (tempDb.exists()) tempDb.delete()
-        }
-    } catch (e: Exception) {
-        return@withContext false to "Wipe error: ${e.localizedMessage}"
-    }
-}
-
-fun getDisplayName(uri: Uri): String = uri.path?.split(":")?.lastOrNull() ?: uri.toString()
-
-fun ensureCaveArchiveColumn(db: SQLiteDatabase) {
-    val tables = listOf("surveys", "shots", "fixeds")
-    for (table in tables) {
-        try {
-            val cursor = db.rawQuery("SELECT * FROM $table LIMIT 0", null)
-            val exists = cursor.getColumnIndex("caveArchive") != -1
-            cursor.close()
-            if (!exists) {
-                db.execSQL("ALTER TABLE $table ADD COLUMN caveArchive INTEGER DEFAULT 0")
-            }
-        } catch (e: Exception) {
-            // Table might not exist yet in TopoDroid DB if it's very old or corrupted
-        }
-    }
-    db.execSQL("CREATE TABLE IF NOT EXISTS CA_Archives (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT)")
-    db.execSQL("CREATE TABLE IF NOT EXISTS CA_Surveys (id INTEGER PRIMARY KEY AUTOINCREMENT, archiveId INTEGER, file_name TEXT, drive_id TEXT, modified_time TEXT)")
-    db.execSQL("CREATE TABLE IF NOT EXISTS CA_Files (id INTEGER PRIMARY KEY AUTOINCREMENT, archiveId INTEGER, path TEXT, drive_id TEXT, modified_time TEXT)")
-}
-
-suspend fun migrateJsonToDb(context: Context, folderUri: Uri) = withContext(Dispatchers.IO) {
-    try {
-        val parent = DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext
-        val archiveFolder = parent.findFile("CaveArchive") ?: return@withContext
-        val dbFile = parent.findFile("distox14.sqlite") ?: return@withContext
-
-        // Migrate Archives (Settings)
-        val settingsFile = archiveFolder.findFile("CaveArchive_Settings.json")
-        if (settingsFile != null) {
-            val current = loadSettings(context, folderUri)
-            if (current.isEmpty()) {
-                val jsonStr = context.contentResolver.openInputStream(settingsFile.uri)?.use { it.bufferedReader().readText() } ?: ""
-                val array = JSONObject(jsonStr).getJSONArray("archives")
-                val toMigrate = List(array.length()) { i ->
-                    val obj = array.getJSONObject(i)
-                    ArchiveConfig(name = obj.getString("name"), url = obj.getString("url"))
-                }
-                if (toMigrate.isNotEmpty()) {
-                    saveSettings(context, folderUri, toMigrate)
-                }
-            }
-        }
-
-        // Migrate Files Inventory
-        val inventoryFile = archiveFolder.findFile("CaveArchive_files.json")
-        if (inventoryFile != null) {
-            val tempDb = JFile(context.cacheDir, "migrate_files_temp.sqlite")
-            context.contentResolver.openInputStream(dbFile.uri)?.use { input ->
-                FileOutputStream(tempDb).use { output -> input.copyTo(output) }
-            }
-
-            SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
-                ensureCaveArchiveColumn(db)
-                val count = db.rawQuery("SELECT COUNT(*) FROM CA_Files", null).use { if (it.moveToFirst()) it.getInt(0) else 0 }
-                if (count == 0) {
-                    val jsonStr = context.contentResolver.openInputStream(inventoryFile.uri)?.use { it.bufferedReader().readText() } ?: ""
-                    val array = JSONObject(jsonStr).getJSONArray("downloaded_files")
-                    val archives = loadSettings(context, folderUri)
-                    if (archives.isNotEmpty()) {
-                        val firstArchiveId = archives.first().id
-                        db.beginTransaction()
-                        try {
-                            for (i in 0 until array.length()) {
-                                val item = array.get(i)
-                                val obj = if (item is JSONObject) item else null
-                                if (obj != null) {
-                                    val values = ContentValues().apply {
-                                        put("archiveId", firstArchiveId)
-                                        put("path", obj.getString("path"))
-                                        put("drive_id", obj.getString("drive_id"))
-                                        put("modified_time", obj.getString("modified_time"))
-                                    }
-                                    db.insert("CA_Files", null, values)
-                                }
-                            }
-                            db.setTransactionSuccessful()
-                        } finally {
-                            db.endTransaction()
-                        }
-                    }
-                }
-            }
-            context.contentResolver.openOutputStream(dbFile.uri, "wt")?.use { output ->
-                tempDb.inputStream().use { input -> input.copyTo(output) }
-                output.flush()
-            }
             tempDb.delete()
-        }
-    } catch (e: Exception) { e.printStackTrace() }
-}
-
-suspend fun syncDriveFolderOAuth(
-    context: Context, archive: ArchiveConfig, localFolderUri: Uri, onLog: (String, Color) -> Unit, checkCancelled: () -> Boolean
-): Pair<Boolean, String> = withContext(Dispatchers.IO) {
-    suspend fun safeLog(text: String, color: Color = Color.White) = withContext(Dispatchers.Main) { onLog(text, color) }
-    suspend fun <T> runWithRetry(name: String, block: () -> T): T {
-        var lastEx: Throwable? = null
-        var currentDelay = 2000L
-        for (i in 1..3) {
-            if (checkCancelled()) throw kotlinx.coroutines.CancellationException()
-            
-            try {
-                return withTimeout(180000) { // Increased to 3 minutes
-                    kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
-                        block()
-                    }
-                }
-            } catch (t: Throwable) {
-                if (t is kotlinx.coroutines.CancellationException && t !is kotlinx.coroutines.TimeoutCancellationException) {
-                    throw t
-                }
-                
-                lastEx = t
-                if (i < 3) {
-                    val errorDetail = t.localizedMessage ?: "Timeout or Network error"
-                    safeLog("Retry $i/3: $name ($errorDetail)", Color.Yellow)
-                    delay(currentDelay)
-                    currentDelay *= 2 // Exponential backoff
-                } else {
-                    safeLog("Failed after 3 attempts: $name", Color.Red)
-                }
-            }
-        }
-        throw lastEx ?: Exception("Task $name failed after multiple attempts")
-    }
-
-    // Helper to download stream with cancellation check
-    suspend fun downloadFileWithProgress(drive: Drive, driveFileId: String, outputStream: java.io.OutputStream) {
-        val inputStream = drive.files().get(driveFileId).executeMediaAsInputStream()
-        inputStream.use { input ->
-            outputStream.use { output ->
-                val buffer = ByteArray(8192)
-                var bytesRead: Int
-                while (input.read(buffer).also { bytesRead = it } != -1) {
-                    if (checkCancelled()) throw kotlinx.coroutines.CancellationException()
-                    output.write(buffer, 0, bytesRead)
-                }
-                output.flush()
-            }
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 
-    try {
-        val account = GoogleSignIn.getLastSignedInAccount(context) ?: return@withContext false to "Please Login to Google"
-        val credential = GoogleAccountCredential.usingOAuth2(context, Collections.singleton(DriveScopes.DRIVE_READONLY)).apply { selectedAccount = account.account }
-        val drive = Drive.Builder(AndroidHttp.newCompatibleTransport(), GsonFactory.getDefaultInstance(), credential).setApplicationName("CaveArchive").build()
-
-        val folderId = if (archive.url.contains("/folders/")) archive.url.split("/folders/").getOrNull(1)?.split("?")?.getOrNull(0)
-                       else if (archive.url.contains("id=")) archive.url.split("id=").getOrNull(1)?.split("&")?.getOrNull(0)
-                       else null
-
-        if (folderId == null) return@withContext false to "Invalid URL"
-
-        safeLog("Connecting to Drive...", Color.Cyan)
-        val driveFiles = runWithRetry("file list") { drive.files().list().setQ("'$folderId' in parents and trashed = false").setFields("files(id, name, mimeType, modifiedTime)").execute() }.files ?: emptyList()
-        val caveJsonFile = driveFiles.find { it.name == "Cave.json" } ?: return@withContext false to "Cave.json not found"
-
-        val parentFolder = DocumentFile.fromTreeUri(context, localFolderUri) ?: return@withContext false to "Local folder error"
-        val dbDocFile = parentFolder.findFile("distox14.sqlite")
-
-        var updatedCavesCount = 0
-        
-        // Load existing files inventory metadata
-        val existingFilesMetadata = mutableMapOf<String, JSONObject>()
-        if (dbDocFile != null) {
-            try {
-                val tempDb = JFile(context.cacheDir, "metadata_temp.sqlite")
-                context.contentResolver.openInputStream(dbDocFile.uri)?.use { input ->
-                    FileOutputStream(tempDb).use { output -> input.copyTo(output) }
-                }
-                SQLiteDatabase.openDatabase(tempDb.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { db ->
-                    ensureCaveArchiveColumn(db)
-                    db.query("CA_Files", null, "archiveId = ?", arrayOf(archive.id.toString()), null, null, null).use { cursor ->
-                        while (cursor.moveToNext()) {
-                            val path = cursor.getString(cursor.getColumnIndexOrThrow("path"))
-                            existingFilesMetadata[path] = JSONObject().apply {
-                                put("path", path)
-                                put("drive_id", cursor.getString(cursor.getColumnIndexOrThrow("drive_id")))
-                                put("modified_time", cursor.getString(cursor.getColumnIndexOrThrow("modified_time")))
-                            }
-                        }
-                    }
-                }
-                tempDb.delete()
-            } catch (e: Exception) { e.printStackTrace() }
-        }
-
-        if (dbDocFile != null) {
-            val suffix = System.currentTimeMillis()
-            val tempDb = JFile(context.cacheDir, "temp_distox14_$suffix.sqlite")
-            try {
-                safeLog("Updating DB...", Color.Cyan)
-                val jsonStr = runWithRetry("download Cave.json") { drive.files().get(caveJsonFile.id).executeMediaAsInputStream().bufferedReader().use { it.readText() } }
-                val caves = JSONObject(jsonStr).getJSONArray("caves")
-                context.contentResolver.openInputStream(dbDocFile.uri)?.use { input -> FileOutputStream(tempDb).use { input.copyTo(it) } }
-
-                SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
-                    ensureCaveArchiveColumn(db)
-                    
-                    // Load existing metadata from CA_Surveys
-                    val existingSynchedCaves = mutableMapOf<String, JSONObject>()
-                    db.query("CA_Surveys", null, "archiveId = ?", arrayOf(archive.id.toString()), null, null, null).use { cursor ->
-                        while (cursor.moveToNext()) {
-                            val fileName = cursor.getString(cursor.getColumnIndexOrThrow("file_name"))
-                            existingSynchedCaves[fileName] = JSONObject().apply {
-                                put("drive_id", cursor.getString(cursor.getColumnIndexOrThrow("drive_id")))
-                                put("modified_time", cursor.getString(cursor.getColumnIndexOrThrow("modified_time")))
-                            }
-                        }
-                    }
-
-                    db.beginTransaction()
-                    try {
-                        for (i in 0 until caves.length()) {
-                            if (checkCancelled()) break
-                            val cave = caves.getJSONObject(i)
-                            val name = cave.getString("name")
-                            val vals = ContentValues().apply {
-                                put("name", name); put("day", cave.optString("day", "")); put("team", cave.optString("team", ""))
-                                put("comment", cave.optString("comment", ""))
-                                put("caveArchive", archive.id)
-                                put("declination", cave.optDouble("declination", 0.0))
-                                put("init_station", cave.optString("init_station", "")); put("xsections", 0); put("datamode", 0)
-                                put("extend", 0); put("created", 0); put("immutable", 0)
-                            }
-                            val sId = db.query("surveys", arrayOf("id"), "name = ?", arrayOf(name), null, null, null).use { c ->
-                                if (cursorToFirst(c)) { db.update("surveys", vals, "name = ?", arrayOf(name)); c.getInt(0) }
-                                else {
-                                    val next = db.rawQuery("SELECT MAX(id) FROM surveys", null).use { if (cursorToFirst(it)) it.getInt(0) + 1 else 1 }
-                                    vals.put("id", next); db.insert("surveys", null, vals); next
-                                }
-                            }
-                            if (cave.has("fixeds")) {
-                                val f = cave.getJSONObject("fixeds")
-                                val fv = ContentValues().apply {
-                                    put("surveyId", sId)
-                                    put("station", f.optString("station", ""))
-                                    put("longitude", f.optDouble("longitude", 0.0))
-                                    put("latitude", f.optDouble("latitude", 0.0))
-                                    val alt = f.optDouble("altimetric", 0.0)
-                                    put("altitude", f.optDouble("altitude", 0.0))
-                                    put("altimetric", alt)
-                                    put("comment", "")
-                                    put("caveArchive", archive.id)
-                                    put("status", 0)
-                                    put("cs_name", "")
-                                    put("cs_longitude", 0.0)
-                                    put("cs_latitude", 0.0)
-                                    put("cs_altitude", 0.0)
-                                    put("source", 2)
-                                    put("cs_decimals", 2)
-                                    put("convergence", 0.0)
-                                }
-                                db.query("fixeds", arrayOf("id"), "surveyId = ?", arrayOf(sId.toString()), null, null, null).use { c ->
-                                    if (cursorToFirst(c)) { 
-                                        fv.put("id", c.getInt(0))
-                                        db.update("fixeds", fv, "surveyId = ?", arrayOf(sId.toString())) 
-                                    }
-                                    else { 
-                                        fv.put("id", 1)
-                                        db.insert("fixeds", null, fv) 
-                                    }
-                                }
-                            }
-                            if (cave.has("shotsFile") && !checkCancelled()) {
-                                val sName = cave.getString("shotsFile")
-                                driveFiles.find { it.name == sName }?.let { sFile ->
-                                    val currentModifiedTime = sFile.modifiedTime?.toString() ?: ""
-                                    val existingInfo = existingSynchedCaves[sName]
-                                    
-                                    val needsUpdate = existingInfo == null || 
-                                                     existingInfo.optString("drive_id") != sFile.id || 
-                                                     existingInfo.optString("modified_time") != currentModifiedTime
-
-                                    if (!needsUpdate && existingInfo != null) {
-                                        safeLog("$sName is up to date, skipping measurements.", Color.Gray)
-                                    } else {
-                                        val tShots = JFile(context.cacheDir, "temp_shots_$suffix.sqlite")
-                                        runWithRetry("download $sName") { drive.files().get(sFile.id).executeMediaAsInputStream().use { inp -> FileOutputStream(tShots).use { inp.copyTo(it) } } }
-                                        
-                                        // Update metadata in DB
-                                        val metaVals = ContentValues().apply {
-                                            put("archiveId", archive.id)
-                                            put("file_name", sName)
-                                            put("drive_id", sFile.id)
-                                            put("modified_time", currentModifiedTime)
-                                        }
-                                        val existingIdCursor = db.query("CA_Surveys", arrayOf("id"), "archiveId = ? AND file_name = ?", arrayOf(archive.id.toString(), sName), null, null, null)
-                                        if (existingIdCursor.moveToFirst()) {
-                                            db.update("CA_Surveys", metaVals, "id = ?", arrayOf(existingIdCursor.getInt(0).toString()))
-                                        } else {
-                                            db.insert("CA_Surveys", null, metaVals)
-                                        }
-                                        existingIdCursor.close()
-
-                                        SQLiteDatabase.openDatabase(tShots.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { sDb ->
-                                            db.delete("shots", "surveyId = ?", arrayOf(sId.toString()))
-                                            sDb.query("shots", null, null, null, null, null, null).use { sc ->
-                                                if (cursorToFirst(sc)) do {
-                                                    val row = ContentValues()
-                                                    for (col in sc.columnNames) {
-                                                        val idx = sc.getColumnIndex(col)
-                                                        when (sc.getType(idx)) {
-                                                            Cursor.FIELD_TYPE_INTEGER -> row.put(col, sc.getLong(idx))
-                                                            Cursor.FIELD_TYPE_FLOAT -> row.put(col, sc.getDouble(idx))
-                                                            Cursor.FIELD_TYPE_STRING -> row.put(col, sc.getString(idx))
-                                                            Cursor.FIELD_TYPE_BLOB -> row.put(col, sc.getBlob(idx))
-                                                        }
-                                                    }
-                                                    row.put("caveArchive", archive.id)
-                                                    row.put("surveyId", sId)
-                                                    db.insertWithOnConflict("shots", null, row, SQLiteDatabase.CONFLICT_REPLACE)
-                                                } while (sc.moveToNext())
-                                                safeLog("${sc.count} measurements ($name)", Color.Gray)
-                                            }
-                                        }
-                                        tShots.delete()
-                                        updatedCavesCount++
-                                    }
-                                }
-                            }
-                        }
-                        if (!checkCancelled()) db.setTransactionSuccessful()
-                    } finally { if (db.inTransaction()) db.endTransaction() }
-                }
-                if (!checkCancelled()) {
-                    withContext(kotlinx.coroutines.NonCancellable) {
-                        context.contentResolver.openOutputStream(dbDocFile.uri, "wt")?.use { out -> 
-                            tempDb.inputStream().use { input -> input.copyTo(out) }
-                            out.flush() 
-                        }
-                        safeLog("Database updated: $updatedCavesCount sqlite files processed.", Color.Green)
-                    }
-                }
-            } catch (e: Exception) { safeLog("DB Error: ${e.localizedMessage}", Color.Red) }
-            finally { tempDb.delete() }
-        }
-
-        var dlCount = 0
-        val downloadedPathsMetadata = mutableListOf<JSONObject>()
-        for (f in driveFiles) {
-            if (checkCancelled()) break
-            if (f.name == "Cave.json" || f.name.lowercase().endsWith(".zip")) continue
-            val folderName = when {
-                f.name.lowercase().endsWith(".tdconfig") || f.name.lowercase().endsWith(".thconfig") -> "thconfig"
-                f.name.lowercase().endsWith(".asc") || f.name.lowercase().endsWith(".asci") || f.name.lowercase().endsWith(".ascii") -> "DTM"
-                else -> null
-            } ?: continue
-            
-            val path = "$folderName/${f.name}"
-            val currentModifiedTime = f.modifiedTime?.toString() ?: ""
-            val existing = existingFilesMetadata[path]
-            
-            val needsUpdate = existing == null || 
-                             existing.optString("drive_id") != f.id || 
-                             existing.optString("modified_time") != currentModifiedTime
-
-            if (!needsUpdate && existing != null) {
-                safeLog("${f.name} is up to date.", Color.Gray)
-                downloadedPathsMetadata.add(existing)
-                continue
-            }
-
-            val dest = parentFolder.findFile(folderName) ?: parentFolder.createDirectory(folderName)
-            dest?.let { d ->
-                try {
-                    val target = d.findFile(f.name) ?: d.createFile(f.mimeType, f.name)
-                    target?.let { t -> 
-                        runWithRetry("download ${f.name}") {
-                            context.contentResolver.openOutputStream(t.uri)?.use { outStream ->
-                                kotlinx.coroutines.runBlocking {
-                                    downloadFileWithProgress(drive, f.id, outStream)
-                                }
-                            }
-                        }
-                        // Solo se il download ha avuto successo, aggiungiamo ai metadata
-                        downloadedPathsMetadata.add(JSONObject().apply {
-                            put("path", path)
-                            put("drive_id", f.id)
-                            put("modified_time", currentModifiedTime)
-                        })
-                    }
-                    safeLog("Saved: ${f.name}", Color.Gray)
-                    dlCount++
-                } catch (e: Exception) {
-                    if (e is kotlinx.coroutines.CancellationException) throw e
-                    safeLog("Failed to save ${f.name}: ${e.localizedMessage}", Color.Red)
-                }
-            }
-        }
-        
-        if (downloadedPathsMetadata.isNotEmpty()) {
-            updateFilesInventory(context, localFolderUri, archive.id, downloadedPathsMetadata)
-        }
-
-        return@withContext true to (if (checkCancelled()) "Interrupted." else "Files updated: $dlCount files downloaded.")
-    } catch (t: Throwable) { return@withContext false to "Error: ${t.localizedMessage}" }
+@Preview(showBackground = true)
+@Composable
+fun MainScreenPreview() {
+    CaveArchiveTheme { MainScreen() }
 }
-
-private fun cursorToFirst(c: Cursor?): Boolean = c?.moveToFirst() ?: false
-
-suspend fun updateFilesInventory(context: Context, folderUri: Uri, archiveId: Int, newItems: List<JSONObject>) = withContext(Dispatchers.IO) {
-    try {
-        val parent = DocumentFile.fromTreeUri(context, folderUri) ?: return@withContext
-        val dbDocFile = parent.findFile("distox14.sqlite") ?: return@withContext
-
-        val tempDb = JFile(context.cacheDir, "update_files_temp.sqlite")
-        context.contentResolver.openInputStream(dbDocFile.uri)?.use { input ->
-            FileOutputStream(tempDb).use { output -> input.copyTo(output) }
-        }
-
-        SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
-            ensureCaveArchiveColumn(db)
-            db.beginTransaction()
-            try {
-                newItems.forEach { newItem ->
-                    val path = newItem.getString("path")
-                    val vals = ContentValues().apply {
-                        put("archiveId", archiveId)
-                        put("path", path)
-                        put("drive_id", newItem.getString("drive_id"))
-                        put("modified_time", newItem.getString("modified_time"))
-                    }
-                    
-                    val existingIdCursor = db.query("CA_Files", arrayOf("id"), "archiveId = ? AND path = ?", arrayOf(archiveId.toString(), path), null, null, null)
-                    if (existingIdCursor.moveToFirst()) {
-                        db.update("CA_Files", vals, "id = ?", arrayOf(existingIdCursor.getInt(0).toString()))
-                    } else {
-                        db.insert("CA_Files", null, vals)
-                    }
-                    existingIdCursor.close()
-                }
-                db.setTransactionSuccessful()
-            } finally {
-                db.endTransaction()
-            }
-        }
-
-        context.contentResolver.openOutputStream(dbDocFile.uri, "wt")?.use { output ->
-            tempDb.inputStream().use { input -> input.copyTo(output) }
-            output.flush()
-        }
-        tempDb.delete()
-    } catch (e: Exception) { e.printStackTrace() }
 }
-
-@Preview(showBackground = true) @Composable fun MainScreenPreview() { CaveArchiveTheme { MainScreen() } }
