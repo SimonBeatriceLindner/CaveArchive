@@ -814,6 +814,7 @@ fun UploadDialog(
     var newName by remember { mutableStateOf("") }
     
     var isBranchMode by remember { mutableStateOf(false) }
+    var isGeopointMode by remember { mutableStateOf(true) }
     var selectedFirstStation by remember { mutableStateOf("") }
     var selectedSurveyToConnect by remember { mutableStateOf<SurveyInfo?>(null) }
     var selectedSecondStation by remember { mutableStateOf("") }
@@ -927,23 +928,23 @@ fun UploadDialog(
                 item {
                     Column {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            RadioButton(
-                                selected = !isBranchMode,
-                                onClick = { isBranchMode = false }
+                            Checkbox(
+                                checked = isGeopointMode,
+                                onCheckedChange = { isGeopointMode = it }
                             )
                             Text(
                                 "Upload geopoint",
-                                modifier = Modifier.clickable { isBranchMode = false }
+                                modifier = Modifier.clickable { isGeopointMode = !isGeopointMode }
                             )
                         }
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            RadioButton(
-                                selected = isBranchMode,
-                                onClick = { isBranchMode = true }
+                            Checkbox(
+                                checked = isBranchMode,
+                                onCheckedChange = { isBranchMode = it }
                             )
                             Text(
                                 "Join branch",
-                                modifier = Modifier.clickable { isBranchMode = true }
+                                modifier = Modifier.clickable { isBranchMode = !isBranchMode }
                             )
                         }
                     }
@@ -1068,7 +1069,7 @@ fun UploadDialog(
                         
                         // Avvia l'upload usando lo scope del MainScreen così non si interrompe
                         externalScope.launch {
-                            uploadSurveyToDrive(context, selectedArchive, localFolderUri, survey, newName, !isBranchMode, junctionData, onLog)
+                            uploadSurveyToDrive(context, selectedArchive, localFolderUri, survey, newName, isGeopointMode, junctionData, onLog)
                         }
                     }
                 },
@@ -1321,6 +1322,7 @@ suspend fun uploadSurveyToDrive(
             }
 
             if (uploadGeopoint) {
+                val fixedsArray = JSONArray()
                 srcDb.query(
                     "fixeds",
                     null,
@@ -1330,7 +1332,7 @@ suspend fun uploadSurveyToDrive(
                     null,
                     null
                 ).use { fc ->
-                    if (fc.moveToFirst()) {
+                    while (fc.moveToNext()) {
                         val fixedsObj = JSONObject()
                         fixedsObj.put(
                             "station",
@@ -1352,10 +1354,14 @@ suspend fun uploadSurveyToDrive(
                             "altitude",
                             fc.getDouble(fc.getColumnIndexOrThrow("altitude"))
                         )
-                        surveyDataJson.put("fixeds", fixedsObj)
-                    } else {
-                        throw Exception("No geopoint (fixed station) found for this survey. Please add one in TopoDroid or use 'Join branch' mode.")
+                        fixedsArray.put(fixedsObj)
                     }
+                }
+                
+                if (fixedsArray.length() > 0) {
+                    surveyDataJson.put("fixeds", fixedsArray)
+                } else {
+                    throw Exception("No geopoint (fixed station) found for this survey. Please add one in TopoDroid or use 'Join branch' mode.")
                 }
             }
 
@@ -1366,7 +1372,7 @@ suspend fun uploadSurveyToDrive(
         }
 
         val cavesFolderId = getOrCreateFolder(drive, folderId, "caves")
-        val projectsFolderId = getOrCreateFolder(drive, folderId, "projects")
+        val projectFolderId = getOrCreateFolder(drive, folderId, "project")
 
         withContext(Dispatchers.Main) {
             onLog(
@@ -1431,100 +1437,109 @@ suspend fun uploadSurveyToDrive(
                 found = true; break
             }
         }
-        // 6. Aggiorna eventuale file .tdconfig (nella cartella projects/)
+        // 6. Aggiorna o crea eventuale file .tdconfig (nella cartella project/)
         val projectDirFiles =
-            drive.files().list().setQ("'$projectsFolderId' in parents and trashed = false")
+            drive.files().list().setQ("'$projectFolderId' in parents and trashed = false")
                 .setFields("files(id, name)").execute().files ?: emptyList()
         val tdPattern = Regex("(.+?)([0-9a-fA-F]{5})\\.tdconfig")
 
-        // Identifica il progetto corrente se presente
-        val currentProjectPath = caveJsonObject.optString("projectFile")
+        // Identifica il progetto corrente o usa quello di default
+        var currentProjectPath = caveJsonObject.optString("projectFile")
+        if (currentProjectPath.isEmpty()) {
+            currentProjectPath = "project/caveArchiveProject.tdconfig"
+        }
 
-        if (currentProjectPath.isNotEmpty()) {
-            val baseName = currentProjectPath.split("/").last().let { name ->
-                tdPattern.matchEntire(name)?.groupValues?.get(1) ?: name.removeSuffix(".tdconfig")
+        val baseName = currentProjectPath.split("/").last().let { name ->
+            tdPattern.matchEntire(name)?.groupValues?.get(1) ?: name.removeSuffix(".tdconfig")
+        }
+
+        // Cerchiamo tutti i .tdconfig dello stesso progetto
+        val versions = projectDirFiles.filter { it.name.startsWith(baseName) && it.name.endsWith(".tdconfig") }
+
+        try {
+            val updatedTdContent: String
+            val nextName: String
+            val nextPath: String
+
+            if (versions.isEmpty()) {
+                // Crea nuovo progetto da template
+                val nextVer = 1
+                nextName = "$baseName${nextVer.toString(16).padStart(5, '0').uppercase()}.tdconfig"
+                nextPath = "project/$nextName"
+                
+                val color = (Math.random() * 16777215).toInt()
+                val sb = StringBuilder()
+                sb.append("source\n")
+                sb.append("  survey \"$baseName\"\n")
+                sb.append("    load \"$newName\" -color $color\n")
+                if (junctionData != null) {
+                    sb.append("    equate \"${junctionData.firstStation}@$newName\" \"${junctionData.secondStation}@${junctionData.otherSurveyName}\"\n")
+                }
+                sb.append("  endsurvey\n")
+                sb.append("endsource")
+                updatedTdContent = sb.toString()
+            } else {
+                val latest = versions.mapNotNull { f ->
+                    val m = tdPattern.matchEntire(f.name)
+                    if (m != null) f to m.groupValues[2].toInt(16) else f to 0
+                }.maxByOrNull { it.second }!!
+
+                val currentFile = latest.first
+                val nextVer = latest.second + 1
+                nextName = "$baseName${nextVer.toString(16).padStart(5, '0').uppercase()}.tdconfig"
+                nextPath = "project/$nextName"
+
+                val content = drive.files().get(currentFile.id).executeMediaAsInputStream()
+                    .bufferedReader(Charset.forName("UTF-8")).use { it.readText() }
+                val lines = content.lines().toMutableList()
+                val searchPattern = "load \"$newName\""
+
+                if (!lines.any { it.trim().startsWith(searchPattern) }) {
+                    var insertIndex = -1
+                    for (i in lines.indices.reversed()) {
+                        if (lines[i].trim().startsWith("load ") || lines[i].trim().startsWith("survey ")) {
+                            insertIndex = i + 1; break
+                        }
+                    }
+                    if (insertIndex != -1) {
+                        val color = (Math.random() * 16777215).toInt()
+                        lines.add(insertIndex, "    load \"$newName\" -color $color")
+                        if (junctionData != null) {
+                            var equateIndex = lines.size - 1
+                            for (i in lines.indices.reversed()) if (lines[i].trim() == "endsurvey") {
+                                equateIndex = i; break
+                            }
+                            lines.add(
+                                equateIndex,
+                                "    equate \"${junctionData.firstStation}@$newName\" \"${junctionData.secondStation}@${junctionData.otherSurveyName}\""
+                            )
+                        }
+                    }
+                    updatedTdContent = lines.joinToString("\n")
+                } else {
+                    updatedTdContent = "" // Segnale per non caricare duplicati
+                }
             }
 
-            // Cerchiamo tutti i .tdconfig dello stesso progetto
-            val versions =
-                projectDirFiles.filter { it.name.startsWith(baseName) && it.name.endsWith(".tdconfig") }
+            if (updatedTdContent.isNotEmpty()) {
+                val tempTdFile = JFile(context.cacheDir, nextName).apply { writeText(updatedTdContent) }
+                val meta = File().apply { setName(nextName); setParents(listOf(projectFolderId)) }
+                drive.files().create(
+                    meta,
+                    com.google.api.client.http.FileContent("application/octet-stream", tempTdFile)
+                ).execute()
+                tempTdFile.delete()
 
-            if (versions.isNotEmpty()) {
-                try {
-                    val latest = versions.mapNotNull { f ->
-                        val m = tdPattern.matchEntire(f.name)
-                        if (m != null) f to m.groupValues[2].toInt(16) else f to 0
-                    }.maxByOrNull { it.second }!!
+                // Aggiorna il riferimento nel JSON
+                caveJsonObject.put("projectFile", nextPath)
 
-                    val currentFile = latest.first
-                    val nextVer = latest.second + 1
-                    val nextName =
-                        "$baseName${nextVer.toString(16).padStart(5, '0').uppercase()}.tdconfig"
-                    val nextPath = "projects/$nextName"
-
-                    val content = drive.files().get(currentFile.id).executeMediaAsInputStream()
-                        .bufferedReader(Charset.forName("UTF-8")).use { it.readText() }
-                    val lines = content.lines().toMutableList()
-                    val searchPattern = "load \"$newName\""
-
-                    if (!lines.any { it.trim().startsWith(searchPattern) }) {
-                        var insertIndex = -1
-                        for (i in lines.indices.reversed()) {
-                            if (lines[i].trim().startsWith("load ") || lines[i].trim()
-                                    .startsWith("survey ")
-                            ) {
-                                insertIndex = i + 1; break
-                            }
-                        }
-                        if (insertIndex != -1) {
-                            val color = (Math.random() * 16777215).toInt()
-                            lines.add(insertIndex, "    load \"$newName\" -color $color")
-                            if (junctionData != null) {
-                                var equateIndex = lines.size - 1
-                                for (i in lines.indices.reversed()) if (lines[i].trim() == "endsurvey") {
-                                    equateIndex = i; break
-                                }
-                                lines.add(
-                                    equateIndex,
-                                    "    equate \"${junctionData.firstStation}@$newName\" \"${junctionData.secondStation}@${junctionData.otherSurveyName}\""
-                                )
-                            }
-                            val updatedTdContent = lines.joinToString("\n")
-                            val tempTdFile = JFile(
-                                context.cacheDir,
-                                nextName
-                            ).apply { writeText(updatedTdContent) }
-
-                            val meta =
-                                File().apply { setName(nextName); setParents(listOf(projectsFolderId)) }
-                            drive.files().create(
-                                meta,
-                                com.google.api.client.http.FileContent(
-                                    "application/octet-stream",
-                                    tempTdFile
-                                )
-                            ).execute()
-                            tempTdFile.delete()
-
-                            // Aggiorna il riferimento nel JSON
-                            caveJsonObject.put("projectFile", nextPath)
-
-                            withContext(Dispatchers.Main) {
-                                onLog(
-                                    "Created version $nextName",
-                                    Color.Green
-                                )
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    withContext(Dispatchers.Main) {
-                        onLog(
-                            "ERROR updating project: ${e.localizedMessage}",
-                            Color.Red
-                        )
-                    }
+                withContext(Dispatchers.Main) {
+                    onLog("Created version $nextName", Color.Green)
                 }
+            }
+        } catch (e: Exception) {
+            withContext(Dispatchers.Main) {
+                onLog("ERROR updating project: ${e.localizedMessage}", Color.Red)
             }
         }
 
@@ -1712,25 +1727,40 @@ suspend fun wipeManagedData(
                         var deletedFilesCount = 0
                         db.query(
                             "CA_Files",
-                            arrayOf("path"),
+                            arrayOf("path", "local_path"),
                             if (archiveId == null) null else "archiveId = ?",
                             whereArgs,
                             null,
                             null,
                             null
                         ).use { cursor ->
+                            val versionPattern = Regex("(.+?)([0-9a-fA-F]{5})\\.(tdconfig|asc|asci|ascii)")
                             while (cursor.moveToNext()) {
-                                val cloudPath = cursor.getString(0) // es: "projects/nome.tdconfig"
+                                val cloudPath = cursor.getString(0) // es: "projects/nome0000A.tdconfig"
+                                val localPath = cursor.getString(1) // es: "nome.tdconfig"
+                                
                                 val parts = cloudPath.split("/")
                                 if (parts.size == 2) {
-                                    // Mappa il nome della cartella cloud alla cartella locale di TopoDroid
                                     val localDirName = when (parts[0]) {
-                                        "projects" -> "thconfig"
+                                        "project" -> "thconfig"
                                         "DEMs" -> "DTM"
                                         else -> parts[0]
                                     }
-                                    parent?.findFile(localDirName)?.findFile(parts[1])?.delete()
-                                    deletedFilesCount++
+                                    
+                                    val fileToDelete = if (!localPath.isNullOrEmpty()) {
+                                        parent?.findFile(localDirName)?.findFile(localPath)
+                                    } else {
+                                        // Fallback logic for older records or if local_path is null
+                                        val match = versionPattern.matchEntire(parts[1])
+                                        val baseNameWithExt = if (match != null) "${match.groupValues[1]}.${match.groupValues[3]}" else parts[1]
+                                        
+                                        val folder = parent?.findFile(localDirName)
+                                        folder?.findFile(baseNameWithExt) ?: folder?.findFile(parts[1])
+                                    }
+                                    
+                                    if (fileToDelete?.delete() == true) {
+                                        deletedFilesCount++
+                                    }
                                 }
                             }
                         }
@@ -1799,6 +1829,15 @@ fun ensureCaveArchiveColumn(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE IF NOT EXISTS CA_Archives (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT)")
         db.execSQL("CREATE TABLE IF NOT EXISTS CA_Surveys (id INTEGER PRIMARY KEY AUTOINCREMENT, archiveId INTEGER, file_name TEXT, drive_id TEXT, modified_time TEXT)")
         db.execSQL("CREATE TABLE IF NOT EXISTS CA_Files (id INTEGER PRIMARY KEY AUTOINCREMENT, archiveId INTEGER, path TEXT, drive_id TEXT, modified_time TEXT)")
+        
+        // Add local_path to CA_Files if missing
+        try {
+            val cursor = db.rawQuery("SELECT * FROM CA_Files LIMIT 0", null)
+            if (cursor.getColumnIndex("local_path") == -1) {
+                db.execSQL("ALTER TABLE CA_Files ADD COLUMN local_path TEXT")
+            }
+            cursor.close()
+        } catch (e: Exception) {}
     }
 
 suspend fun migrateJsonToDb(context: Context, folderUri: Uri) = withContext(Dispatchers.IO) {
@@ -2082,51 +2121,45 @@ suspend fun syncDriveFolderOAuth(
                                 }
 
                                 if (cave.has("fixeds")) {
-                                    val f = cave.getJSONObject("fixeds")
-                                    val fv = ContentValues().apply {
-                                        put("surveyId", sId); put(
-                                        "station",
-                                        f.optString("station", "")
-                                    )
-                                        put(
-                                            "longitude",
-                                            f.optDouble("longitude", 0.0)
-                                        ); put("latitude", f.optDouble("latitude", 0.0))
-                                        put(
-                                            "altitude",
-                                            f.optDouble("altitude", 0.0)
-                                        ); put("altimetric", f.optDouble("altimetric", 0.0))
-                                        put("comment", ""); put(
-                                        "archiveId",
-                                        archive.id
-                                    ); put("status", 0); put("cs_name", ""); put(
-                                        "cs_longitude",
-                                        0.0
-                                    ); put("cs_latitude", 0.0); put(
-                                        "cs_altitude",
-                                        0.0
-                                    ); put("source", 2); put("cs_decimals", 2); put(
-                                        "convergence",
-                                        0.0
-                                    )
-                                    }
-                                    db.query(
-                                        "fixeds",
-                                        arrayOf("id"),
-                                        "surveyId = ?",
-                                        arrayOf(sId.toString()),
-                                        null,
-                                        null,
-                                        null
-                                    ).use { c ->
-                                        if (cursorToFirst(c)) db.update(
+                                    val fixedsItem = cave.get("fixeds")
+                                    val fixedsArray = if (fixedsItem is JSONArray) fixedsItem else JSONArray().put(fixedsItem)
+                                    
+                                    for (j in 0 until fixedsArray.length()) {
+                                        val f = fixedsArray.getJSONObject(j)
+                                        val station = f.optString("station", "")
+                                        val fv = ContentValues().apply {
+                                            put("surveyId", sId)
+                                            put("station", station)
+                                            put("longitude", f.optDouble("longitude", 0.0))
+                                            put("latitude", f.optDouble("latitude", 0.0))
+                                            put("altitude", f.optDouble("altitude", 0.0))
+                                            put("altimetric", f.optDouble("altimetric", 0.0))
+                                            put("comment", "")
+                                            put("archiveId", archive.id)
+                                            put("status", 0)
+                                            put("cs_name", "")
+                                            put("cs_longitude", 0.0)
+                                            put("cs_latitude", 0.0)
+                                            put("cs_altitude", 0.0)
+                                            put("source", 2)
+                                            put("cs_decimals", 2)
+                                            put("convergence", 0.0)
+                                        }
+                                        
+                                        db.query(
                                             "fixeds",
-                                            fv,
-                                            "surveyId = ?",
-                                            arrayOf(sId.toString())
-                                        )
-                                        else {
-                                            fv.put("id", 1); db.insert("fixeds", null, fv)
+                                            arrayOf("id"),
+                                            "surveyId = ? AND station = ?",
+                                            arrayOf(sId.toString(), station),
+                                            null,
+                                            null,
+                                            null
+                                        ).use { c ->
+                                            if (cursorToFirst(c)) {
+                                                db.update("fixeds", fv, "id = ?", arrayOf(c.getInt(0).toString()))
+                                            } else {
+                                                db.insert("fixeds", null, fv)
+                                            }
                                         }
                                     }
                                 }
@@ -2390,7 +2423,10 @@ suspend fun syncDriveFolderOAuth(
                                         localFolderUri,
                                         archive.id,
                                         listOf(JSONObject().apply {
-                                            put("path", fullPath); put("drive_id", latestRemoteFile.id); put("modified_time", currentModifiedTime)
+                                            put("path", fullPath)
+                                            put("drive_id", latestRemoteFile.id)
+                                            put("modified_time", currentModifiedTime)
+                                            put("local_path", localName)
                                         })
                                     )
                                 }
@@ -2458,6 +2494,9 @@ suspend fun updateFilesInventorySuspend(
                             put("path", path)
                             put("drive_id", newItem.getString("drive_id"))
                             put("modified_time", newItem.getString("modified_time"))
+                            if (newItem.has("local_path")) {
+                                put("local_path", newItem.getString("local_path"))
+                            }
                         }
 
                         val existingIdCursor = db.query(
