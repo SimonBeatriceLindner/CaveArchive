@@ -1,3 +1,120 @@
 <resources>
     <string name="app_name">CaveArchive</string>
+
+    <!-- Main Screen -->
+    <string name="app_title">CaveArchive</string>
+    <string name="main_subtitle">Synchronize TopoDroid surveys to Google Drive</string>
+    <string name="btn_sync">Sync</string>
+    <string name="btn_stop_sync">Stop Sync</string>
+    <string name="btn_google_login">Google Login</string>
+    <string name="status_syncing">Syncing...</string>
+    <string name="status_stopping">Stopping...</string>
+    <string name="label_configuration">Configuration:</string>
+    <string name="label_folder">Folder: %1$s</string>
+    <string name="folder_not_selected">Not selected</string>
+    <string name="select_archive">Select Archive</string>
+    <string name="toast_logs_copied">Logs copied to clipboard</string>
+    <string name="desc_copy_console">Copy Console</string>
+    <string name="desc_clear_console">Clear Console</string>
+
+    <!-- Menu -->
+    <string name="menu_upload">Upload</string>
+    <string name="menu_site">Site</string>
+    <string name="menu_logout">Logout</string>
+    <string name="menu_wipe_data">Wipe data</string>
+    <string name="menu_info">Info</string>
+
+    <!-- Info Dialog -->
+    <string name="info_title">CaveArchive Info</string>
+    <string name="info_version">Version: %1$s</string>
+    <string name="info_release_date">Release date: June 2026</string>
+    <string name="info_developer">Developer: Simon Beatrice Lidner</string>
+    <string name="info_email">Email: </string>
+    <string name="info_bugs_suggestion">Please report bugs and suggest new features.</string>
+
+    <!-- Wipe Dialog -->
+    <string name="wipe_title">Wipe Managed Data</string>
+    <string name="wipe_confirmation">Are you sure you want to delete data synchronized with CaveArchive?</string>
+    <string name="wipe_all_data">Wipe all data</string>
+    <string name="wipe_select_archive">Select archive:</string>
+    <string name="wipe_warning">Only data managed by CaveArchive (marked in the \'archiveId\' column) will be removed. Your personal surveys will remain safe.</string>
+    <string name="btn_confirm">Confirm</string>
+    <string name="btn_cancel">Cancel</string>
+    <string name="btn_ok">OK</string>
+
+    <!-- Settings / Manage Archives Dialog -->
+    <string name="settings_title">Settings</string>
+    <string name="label_storage_folder">Storage Folder:</string>
+    <string name="btn_change">Change</string>
+    <string name="label_drive_archives">Drive Archives:</string>
+    <string name="btn_add_archive">Add Archive</string>
+    <string name="desc_open_drive">Open in Drive</string>
+    <string name="toast_cannot_open_url">Cannot open URL</string>
+    <string name="dialog_new_archive">New</string>
+    <string name="dialog_edit_archive">Edit</string>
+    <string name="label_name">Name</string>
+    <string name="label_drive_url">Drive URL</string>
+    <string name="btn_save">Save</string>
+
+    <!-- Upload Dialog -->
+    <string name="upload_title">Upload Survey</string>
+    <string name="label_select_survey">Select Survey:</string>
+    <string name="label_new_name">New name</string>
+    <string name="option_upload_geopoint">Upload geopoint</string>
+    <string name="option_join_branch">Join branch</string>
+    <string name="label_first_junction">First junction point:</string>
+    <string name="label_survey_to_connect">Survey to connect:</string>
+    <string name="label_second_junction">Second junction point:</string>
+    <string name="hint_search_station">Search station</string>
+    <string name="btn_upload">Upload</string>
+
+    <!-- Logs and Messages -->
+    <string name="log_folder_set">Folder set successfully</string>
+    <string name="log_loaded_archives">Loaded %1$d archives from database.</string>
+    <string name="log_sync_disabled_no_url">Sync disabled: Please configure an Archive URL in settings.</string>
+    <string name="log_sync_disabled_no_db">Sync disabled: distox14.sqlite not found in selected folder!</string>
+    <string name="log_sync_disabled_no_selection">Sync disabled: No valid archive selected.</string>
+    <string name="log_error_loading_folder">Error loading folder: %1$s</string>
+    <string name="log_error_archive_id">Error: Archive ID not initialized. Please re-select the archive.</string>
+    <string name="log_sync_started">Sync started...</string>
+    <string name="log_sync_stopped">Sync stopped by user</string>
+    <string name="log_error_general">ERROR: %1$s</string>
+    <string name="log_wipe_id_error">Error: Archive ID not valid. Please restart the app.</string>
+    <string name="log_logged_out">Logged out</string>
+    <string name="log_login_success">Google Login successful</string>
+    <string name="log_login_error">Google Login error: %1$s</string>
+
+    <!-- Drive / Sync logic messages (used in code) -->
+    <string name="sync_connecting">Connecting to Drive...</string>
+    <string name="sync_using_config">Using config: %1$s</string>
+    <string name="sync_config_not_found">cavesXXXXX.json not found</string>
+    <string name="sync_updating_db">Updating DB...</string>
+    <string name="sync_is_up_to_date">%1$s is up to date.</string>
+    <string name="sync_downloading">Downloading %1$s...</string>
+    <string name="sync_downloading_pct">Downloading %1$s... %2$d%%</string>
+    <string name="sync_db_updated">DB updated: %1$d surveys processed.</string>
+    <string name="sync_completed">Sync completed successfully.</string>
+    <string name="sync_interrupted">Interrupted.</string>
+    <string name="sync_error">Error: %1$s</string>
+    <string name="sync_error_invalid_url">Invalid URL</string>
+    <string name="sync_error_shots_not_found">ERROR: Shots file \'%1$s\' not found in Drive caves/ folder!</string>
+
+    <string name="upload_starting">Starting upload: %1$s</string>
+    <string name="upload_processing">Processing Survey ID: %1$d (%2$s)</string>
+    <string name="upload_error_no_geopoint">No geopoint (fixed station) found for this survey. Please add one in TopoDroid or use \'Join branch\' mode.</string>
+    <string name="upload_cleaning">Cleaning old files in caves/ folder...</string>
+    <string name="upload_duplicate_warning">WARNING: Duplicate %1$s remains in caves/!</string>
+    <string name="upload_sqlite">Uploading new SQLite to caves/...</string>
+    <string name="upload_version_created">Created version %1$s</string>
+    <string name="upload_project_error">ERROR updating project: %1$s</string>
+    <string name="upload_completed_version">Upload completed: version %1$s created.</string>
+    <string name="upload_completed_success">Upload completed successfully!</string>
+    <string name="upload_error">Upload ERROR: %1$s</string>
+
+    <string name="wipe_starting">Wiping database data (Archive: %1$s)...</string>
+    <string name="wipe_all">ALL</string>
+    <string name="wipe_files_deleted">Deleted %1$d supporting files.</string>
+    <string name="wipe_data_deleted">Deleted %1$d surveys, %2$d shots and %3$d fixed points.</string>
+    <string name="wipe_success">Wipe completed successfully.</string>
+    <string name="wipe_error">Wipe error: %1$s</string>
 </resources>
