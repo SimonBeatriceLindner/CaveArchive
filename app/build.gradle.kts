@@ -15,8 +15,8 @@ android {
         applicationId = "com.cavearchive.app"
         minSdk = 30
         targetSdk = 36
-        versionCode = 6
-        versionName = "1.1.4"
+        versionCode = 12
+        versionName = "1.1.10"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -30,7 +30,7 @@ android {
                 "proguard-rules.pro"
             )
             ndk {
-                debugSymbolLevel = "SYMBOL_TABLE"
+                debugSymbolLevel = "FULL"
             }
         }
     }

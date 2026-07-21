@@ -46,6 +46,10 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.RadioButtonDefaults
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
@@ -803,39 +807,40 @@ fun UploadDialog(
     onLog: (String, Color) -> Unit,
     externalScope: kotlinx.coroutines.CoroutineScope
 ) {
+    var uploadType by remember { mutableStateOf("survey") }
     var surveys by remember { mutableStateOf(emptyList<SurveyInfo>()) }
     var selectedSurvey by remember { mutableStateOf<SurveyInfo?>(null) }
     var newName by remember { mutableStateOf("") }
     
     var isBranchMode by remember { mutableStateOf(false) }
     var isGeopointMode by remember { mutableStateOf(true) }
-    var selectedFirstStation by remember { mutableStateOf("") }
-    var selectedSurveyToConnect by remember { mutableStateOf<SurveyInfo?>(null) }
-    var selectedSecondStation by remember { mutableStateOf("") }
+
+    // State for DEM upload
+    var demFileUri by remember { mutableStateOf<Uri?>(null) }
+    var demFileName by remember { mutableStateOf("") }
+
+    // State for multiple junctions
+    val junctions = remember { mutableStateListOf<MutableJunctionEntry>() }
     
     var firstSurveyStations by remember { mutableStateOf(emptyList<String>()) }
-    var secondSurveyStations by remember { mutableStateOf(emptyList<String>()) }
     var archiveSurveys by remember { mutableStateOf(emptyList<SurveyInfo>()) }
     
-    var firstStationSearch by remember { mutableStateOf("") }
-    var secondStationSearch by remember { mutableStateOf("") }
-    
-    val filteredFirstStations = remember(firstSurveyStations, firstStationSearch) {
-        if (firstStationSearch.isEmpty()) firstSurveyStations.take(50)
-        else firstSurveyStations.filter { it.contains(firstStationSearch, ignoreCase = true) }.take(50)
-    }
-    
-    val filteredSecondStations = remember(secondSurveyStations, secondStationSearch) {
-        if (secondStationSearch.isEmpty()) secondSurveyStations.take(50)
-        else secondSurveyStations.filter { it.contains(secondStationSearch, ignoreCase = true) }.take(50)
-    }
-
-    var expandedSurvey by remember { mutableStateOf(false) }
-    var expandedFirstStation by remember { mutableStateOf(false) }
-    var expandedSurveyToConnect by remember { mutableStateOf(false) }
-    var expandedSecondStation by remember { mutableStateOf(false) }
-    
     var isUploading by remember { mutableStateOf(false) }
+    val listState = rememberLazyListState()
+
+    // Errors for highlighting
+    var nameError by remember { mutableStateOf(false) }
+    val junctionErrors = remember { mutableStateMapOf<Int, UploadDialogJunctionError>() }
+
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+        onResult = { uri ->
+            uri?.let {
+                demFileUri = it
+                demFileName = getDisplayName(it)
+            }
+        }
+    )
 
     LaunchedEffect(Unit) {
         localFolderUri?.let { uri ->
@@ -857,157 +862,64 @@ fun UploadDialog(
         selectedSurvey?.let { s ->
             localFolderUri?.let { uri ->
                 firstSurveyStations = loadStationsFromDb(context, uri, s.id)
-                selectedFirstStation = firstSurveyStations.firstOrNull() ?: ""
-                firstStationSearch = selectedFirstStation
             }
         }
     }
 
-    LaunchedEffect(selectedSurveyToConnect) {
-        selectedSurveyToConnect?.let { s ->
-            localFolderUri?.let { uri ->
-                secondSurveyStations = loadStationsFromDb(context, uri, s.id)
-                selectedSecondStation = secondSurveyStations.firstOrNull() ?: ""
-                secondStationSearch = selectedSecondStation
-            }
+    LaunchedEffect(isBranchMode) {
+        if (isBranchMode && junctions.isEmpty()) {
+            junctions.add(MutableJunctionEntry())
         }
     }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.upload_title)) },
+        title = null,
         text = {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                item {
-                    Text(stringResource(R.string.label_select_survey), style = MaterialTheme.typography.labelLarge)
-                    ExposedDropdownMenuBox(
-                        expanded = expandedSurvey,
-                        onExpandedChange = { expandedSurvey = it }
-                    ) {
-                        OutlinedTextField(
-                            value = selectedSurvey?.name ?: "",
-                            onValueChange = {},
-                            readOnly = true,
-                            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedSurvey) },
-                            modifier = Modifier
-                                .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
-                                .fillMaxWidth()
-                        )
-                        ExposedDropdownMenu(
-                            expanded = expandedSurvey,
-                            onDismissRequest = { expandedSurvey = false }
-                        ) {
-                            surveys.forEach { survey ->
-                                DropdownMenuItem(
-                                    text = { Text(survey.name) },
-                                    onClick = {
-                                        selectedSurvey = survey
-                                        newName = survey.name
-                                        expandedSurvey = false
-                                    }
-                                )
-                            }
-                        }
-                    }
-                }
-
-                item {
-                    OutlinedTextField(
-                        value = newName,
-                        onValueChange = { newName = it },
-                        label = { Text(stringResource(R.string.label_new_name)) },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-
+            LazyColumn(state = listState, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 item {
                     Column {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Checkbox(
-                                checked = isGeopointMode,
-                                onCheckedChange = { isGeopointMode = it }
-                            )
-                            Text(
-                                stringResource(R.string.option_upload_geopoint),
-                                modifier = Modifier.clickable { isGeopointMode = !isGeopointMode }
-                            )
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { uploadType = "survey" }) {
+                            RadioButton(selected = uploadType == "survey", onClick = { uploadType = "survey" })
+                            Text(stringResource(R.string.option_upload_survey))
                         }
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Checkbox(
-                                checked = isBranchMode,
-                                onCheckedChange = { isBranchMode = it }
-                            )
-                            Text(
-                                stringResource(R.string.option_join_branch),
-                                modifier = Modifier.clickable { isBranchMode = !isBranchMode }
-                            )
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { uploadType = "dem" }) {
+                            RadioButton(selected = uploadType == "dem", onClick = { uploadType = "dem" })
+                            Text(stringResource(R.string.option_upload_dem))
                         }
+                        Spacer(Modifier.height(8.dp))
+                        HorizontalDivider(thickness = 1.dp, color = MaterialTheme.colorScheme.outlineVariant)
                     }
                 }
 
-                if (isBranchMode) {
+                if (uploadType == "survey") {
                     item {
-                        Text(stringResource(R.string.label_first_junction), style = MaterialTheme.typography.labelLarge)
+                        Text(stringResource(R.string.label_select_survey), style = MaterialTheme.typography.labelLarge)
+                        var expanded by remember { mutableStateOf(false) }
                         ExposedDropdownMenuBox(
-                            expanded = expandedFirstStation,
-                            onExpandedChange = { expandedFirstStation = it }
+                            expanded = expanded,
+                            onExpandedChange = { expanded = it }
                         ) {
                             OutlinedTextField(
-                                value = firstStationSearch,
-                                onValueChange = { 
-                                    firstStationSearch = it
-                                    selectedFirstStation = it
-                                    expandedFirstStation = true
-                                },
-                                label = { Text(stringResource(R.string.hint_search_station)) },
-                                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedFirstStation) },
-                                modifier = Modifier
-                                    .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryEditable)
-                                    .fillMaxWidth()
-                            )
-                            ExposedDropdownMenu(
-                                expanded = expandedFirstStation,
-                                onDismissRequest = { expandedFirstStation = false }
-                            ) {
-                                filteredFirstStations.forEach { station ->
-                                    DropdownMenuItem(
-                                        text = { Text(station) },
-                                        onClick = {
-                                            selectedFirstStation = station
-                                            firstStationSearch = station
-                                            expandedFirstStation = false
-                                        }
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    item {
-                        Text(stringResource(R.string.label_survey_to_connect), style = MaterialTheme.typography.labelLarge)
-                        ExposedDropdownMenuBox(
-                            expanded = expandedSurveyToConnect,
-                            onExpandedChange = { expandedSurveyToConnect = it }
-                        ) {
-                            OutlinedTextField(
-                                value = selectedSurveyToConnect?.name ?: "",
+                                value = selectedSurvey?.name ?: "",
                                 onValueChange = {},
                                 readOnly = true,
-                                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedSurveyToConnect) },
+                                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
                                 modifier = Modifier
                                     .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
                                     .fillMaxWidth()
                             )
                             ExposedDropdownMenu(
-                                expanded = expandedSurveyToConnect,
-                                onDismissRequest = { expandedSurveyToConnect = false }
+                                expanded = expanded,
+                                onDismissRequest = { expanded = false }
                             ) {
-                                archiveSurveys.forEach { survey ->
+                                surveys.forEach { survey ->
                                     DropdownMenuItem(
                                         text = { Text(survey.name) },
                                         onClick = {
-                                            selectedSurveyToConnect = survey
-                                            expandedSurveyToConnect = false
+                                            selectedSurvey = survey
+                                            newName = survey.name
+                                            expanded = false
                                         }
                                     )
                                 }
@@ -1015,42 +927,90 @@ fun UploadDialog(
                         }
                     }
 
-                    if (selectedSurveyToConnect != null) {
-                        item {
-                            Text(stringResource(R.string.label_second_junction), style = MaterialTheme.typography.labelLarge)
-                            ExposedDropdownMenuBox(
-                                expanded = expandedSecondStation,
-                                onExpandedChange = { expandedSecondStation = it }
-                            ) {
-                                OutlinedTextField(
-                                    value = secondStationSearch,
-                                    onValueChange = { 
-                                        secondStationSearch = it
-                                        selectedSecondStation = it
-                                        expandedSecondStation = true
-                                    },
-                                    label = { Text(stringResource(R.string.hint_search_station)) },
-                                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedSecondStation) },
-                                    modifier = Modifier
-                                        .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryEditable)
-                                        .fillMaxWidth()
+                    item {
+                        OutlinedTextField(
+                            value = newName,
+                            onValueChange = { 
+                                newName = it
+                                if (it.isNotBlank()) nameError = false
+                            },
+                            label = { Text(stringResource(R.string.label_new_name)) },
+                            modifier = Modifier.fillMaxWidth(),
+                            isError = nameError
+                        )
+                    }
+
+                    item {
+                        Column {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Checkbox(
+                                    checked = isGeopointMode,
+                                    onCheckedChange = { isGeopointMode = it }
                                 )
-                                ExposedDropdownMenu(
-                                    expanded = expandedSecondStation,
-                                    onDismissRequest = { expandedSecondStation = false }
+                                Text(
+                                    stringResource(R.string.option_upload_geopoint),
+                                    modifier = Modifier.clickable { isGeopointMode = !isGeopointMode }
+                                )
+                            }
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Checkbox(
+                                    checked = isBranchMode,
+                                    onCheckedChange = { isBranchMode = it }
+                                )
+                                Text(
+                                    stringResource(R.string.option_join_branch),
+                                    modifier = Modifier.clickable { isBranchMode = !isBranchMode }
+                                )
+                            }
+                        }
+                    }
+
+                    if (isBranchMode) {
+                        junctions.forEachIndexed { index, entry ->
+                            item(key = "junction_$index") {
+                                JunctionUI(
+                                    index = index,
+                                    entry = entry,
+                                    firstSurveyStations = firstSurveyStations,
+                                    archiveSurveys = archiveSurveys,
+                                    context = context,
+                                    folderUri = localFolderUri,
+                                    error = junctionErrors[index] ?: UploadDialogJunctionError(),
+                                    onRemove = if (junctions.size > 1) { { junctions.removeAt(index); junctionErrors.remove(index) } } else null,
+                                    onFirstStationChange = { junctionErrors[index] = (junctionErrors[index] ?: UploadDialogJunctionError()).copy(firstStation = false) },
+                                    onSurveyChange = { junctionErrors[index] = (junctionErrors[index] ?: UploadDialogJunctionError()).copy(survey = false) },
+                                    onSecondStationChange = { junctionErrors[index] = (junctionErrors[index] ?: UploadDialogJunctionError()).copy(secondStation = false) }
+                                )
+                            }
+                        }
+
+                        if (junctions.size < 10) {
+                            item {
+                                TextButton(
+                                    onClick = { junctions.add(MutableJunctionEntry()) },
+                                    modifier = Modifier.fillMaxWidth()
                                 ) {
-                                    filteredSecondStations.forEach { station ->
-                                        DropdownMenuItem(
-                                            text = { Text(station) },
-                                            onClick = {
-                                                selectedSecondStation = station
-                                                secondStationSearch = station
-                                                expandedSecondStation = false
-                                            }
-                                        )
-                                    }
+                                    Icon(Icons.Default.Add, null)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(stringResource(R.string.btn_add_junction))
                                 }
                             }
+                        }
+                    }
+                } else {
+                    item {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(stringResource(R.string.label_select_dem), style = MaterialTheme.typography.labelLarge)
+                            Button(onClick = { 
+                                filePickerLauncher.launch(arrayOf("*/*")) 
+                            }) {
+                                Text(stringResource(R.string.btn_select_file))
+                            }
+                            Text(
+                                if (demFileUri != null) stringResource(R.string.dem_file_selected, demFileName)
+                                else stringResource(R.string.dem_file_not_selected),
+                                style = MaterialTheme.typography.bodySmall
+                            )
                         }
                     }
                 }
@@ -1059,20 +1019,67 @@ fun UploadDialog(
         confirmButton = {
             Button(
                 onClick = {
-                    val survey = selectedSurvey
-                    if (survey != null && newName.isNotBlank() && selectedArchive != null && localFolderUri != null) {
-                        val junctionData = if (isBranchMode && selectedFirstStation.isNotBlank() && selectedSurveyToConnect != null && selectedSecondStation.isNotBlank()) {
-                            JunctionData(selectedFirstStation, selectedSurveyToConnect!!.name, selectedSecondStation)
-                        } else null
-                        
-                        onDismiss()
-                        
-                        externalScope.launch {
-                            uploadSurveyToDrive(context, selectedArchive, localFolderUri, survey, newName, isGeopointMode, junctionData, onLog)
+                    if (uploadType == "survey") {
+                        val survey = selectedSurvey
+                        if (survey != null && selectedArchive != null && localFolderUri != null) {
+                            var hasError = false
+                            
+                            if (newName.isBlank()) {
+                                nameError = true
+                                hasError = true
+                            }
+
+                            val validatedJunctions = mutableListOf<JunctionData>()
+                            if (isBranchMode) {
+                                junctions.forEachIndexed { index, j ->
+                                    val jErr = UploadDialogJunctionError(
+                                        firstStation = j.firstStation.isBlank(),
+                                        survey = j.selectedSurvey == null,
+                                        secondStation = j.secondStation.isBlank()
+                                    )
+                                    if (jErr.firstStation || jErr.survey || jErr.secondStation) {
+                                        junctionErrors[index] = jErr
+                                        hasError = true
+                                    } else {
+                                        validatedJunctions.add(JunctionData(j.firstStation, j.selectedSurvey!!.name, j.secondStation))
+                                    }
+                                }
+                            }
+
+                            if (hasError) {
+                                externalScope.launch {
+                                    if (nameError) {
+                                        listState.animateScrollToItem(1)
+                                    } else {
+                                        val firstErrIndex = junctions.indices.firstOrNull { junctionErrors.containsKey(it) }
+                                        if (firstErrIndex != null) {
+                                            listState.animateScrollToItem(4 + firstErrIndex)
+                                        }
+                                    }
+                                }
+                            } else {
+                                onDismiss()
+                                externalScope.launch {
+                                    uploadSurveyToDrive(context, selectedArchive, localFolderUri, survey, newName, isGeopointMode, validatedJunctions, onLog)
+                                }
+                            }
+                        }
+                    } else {
+                        // DEM Upload
+                        if (demFileUri != null && selectedArchive != null) {
+                            val ext = demFileName.split(".").last().lowercase()
+                            if (ext == "asc" || ext == "asci" || ext == "ascii") {
+                                onDismiss()
+                                externalScope.launch {
+                                    uploadDemToDrive(context, selectedArchive, demFileUri!!, demFileName, onLog)
+                                }
+                            } else {
+                                Toast.makeText(context, "Invalid file extension. Please select .asc, .asci or .ascii", Toast.LENGTH_LONG).show()
+                            }
                         }
                     }
                 },
-                enabled = selectedSurvey != null && newName.isNotBlank()
+                enabled = (uploadType == "survey" && selectedSurvey != null) || (uploadType == "dem" && demFileUri != null)
             ) {
                 Text(stringResource(R.string.btn_upload))
             }
@@ -1082,6 +1089,161 @@ fun UploadDialog(
         }
     )
 }
+
+class MutableJunctionEntry {
+    var firstStation by mutableStateOf("")
+    var firstStationSearch by mutableStateOf("")
+    var selectedSurvey by mutableStateOf<SurveyInfo?>(null)
+    var secondStation by mutableStateOf("")
+    var secondStationSearch by mutableStateOf("")
+    var secondSurveyStations by mutableStateOf(emptyList<String>())
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun JunctionUI(
+    index: Int,
+    entry: MutableJunctionEntry,
+    firstSurveyStations: List<String>,
+    archiveSurveys: List<SurveyInfo>,
+    context: Context,
+    folderUri: Uri?,
+    error: UploadDialogJunctionError,
+    onRemove: (() -> Unit)?,
+    onFirstStationChange: () -> Unit,
+    onSurveyChange: () -> Unit,
+    onSecondStationChange: () -> Unit
+) {
+    val filteredFirstStations = remember(firstSurveyStations, entry.firstStationSearch) {
+        if (entry.firstStationSearch.isEmpty()) firstSurveyStations.take(50)
+        else firstSurveyStations.filter { it.contains(entry.firstStationSearch, ignoreCase = true) }.take(50)
+    }
+    
+    val filteredSecondStations = remember(entry.secondSurveyStations, entry.secondStationSearch) {
+        if (entry.secondStationSearch.isEmpty()) entry.secondSurveyStations.take(50)
+        else entry.secondSurveyStations.filter { it.contains(entry.secondStationSearch, ignoreCase = true) }.take(50)
+    }
+
+    LaunchedEffect(entry.selectedSurvey) {
+        entry.selectedSurvey?.let { s ->
+            folderUri?.let { uri ->
+                entry.secondSurveyStations = loadStationsFromDb(context, uri, s.id)
+                if (entry.secondStation.isEmpty()) {
+                    entry.secondStation = entry.secondSurveyStations.firstOrNull() ?: ""
+                    entry.secondStationSearch = entry.secondStation
+                }
+            }
+        } ?: run {
+            entry.secondSurveyStations = emptyList()
+        }
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+    ) {
+        Column(modifier = Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    stringResource(R.string.label_junction_number, index + 1),
+                    style = MaterialTheme.typography.titleSmall,
+                    modifier = Modifier.weight(1f)
+                )
+                if (onRemove != null) {
+                    IconButton(onClick = onRemove, modifier = Modifier.size(24.dp)) {
+                        Icon(Icons.Default.Delete, stringResource(R.string.desc_remove_junction), tint = MaterialTheme.colorScheme.error)
+                    }
+                }
+            }
+
+            // First Station
+            var expandedFirst by remember { mutableStateOf(false) }
+            ExposedDropdownMenuBox(expanded = expandedFirst, onExpandedChange = { expandedFirst = it }) {
+                OutlinedTextField(
+                    value = entry.firstStationSearch,
+                    onValueChange = { 
+                        entry.firstStationSearch = it
+                        entry.firstStation = it
+                        expandedFirst = true
+                        onFirstStationChange()
+                    },
+                    label = { Text(stringResource(R.string.label_first_junction)) },
+                    isError = error.firstStation,
+                    modifier = Modifier.menuAnchor(ExposedDropdownMenuAnchorType.PrimaryEditable).fillMaxWidth(),
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedFirst) }
+                )
+                ExposedDropdownMenu(expanded = expandedFirst, onDismissRequest = { expandedFirst = false }) {
+                    filteredFirstStations.forEach { s ->
+                        DropdownMenuItem(text = { Text(s) }, onClick = {
+                            entry.firstStation = s
+                            entry.firstStationSearch = s
+                            expandedFirst = false
+                            onFirstStationChange()
+                        })
+                    }
+                }
+            }
+
+            // Target Survey
+            var expandedSurveyBox by remember { mutableStateOf(false) }
+            ExposedDropdownMenuBox(expanded = expandedSurveyBox, onExpandedChange = { expandedSurveyBox = it }) {
+                OutlinedTextField(
+                    value = entry.selectedSurvey?.name ?: "",
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text(stringResource(R.string.label_survey_to_connect)) },
+                    isError = error.survey,
+                    modifier = Modifier.menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable).fillMaxWidth(),
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedSurveyBox) }
+                )
+                ExposedDropdownMenu(expanded = expandedSurveyBox, onDismissRequest = { expandedSurveyBox = false }) {
+                    archiveSurveys.forEach { s ->
+                        DropdownMenuItem(text = { Text(s.name) }, onClick = {
+                            entry.selectedSurvey = s
+                            expandedSurveyBox = false
+                            onSurveyChange()
+                        })
+                    }
+                }
+            }
+
+            // Second Station
+            var expandedSecond by remember { mutableStateOf(false) }
+            ExposedDropdownMenuBox(expanded = expandedSecond, onExpandedChange = { expandedSecond = it }) {
+                OutlinedTextField(
+                    value = entry.secondStationSearch,
+                    onValueChange = { 
+                        entry.secondStationSearch = it
+                        entry.secondStation = it
+                        expandedSecond = true
+                        onSecondStationChange()
+                    },
+                    label = { Text(stringResource(R.string.label_second_junction)) },
+                    isError = error.secondStation,
+                    modifier = Modifier.menuAnchor(ExposedDropdownMenuAnchorType.PrimaryEditable).fillMaxWidth(),
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedSecond) }
+                )
+                ExposedDropdownMenu(expanded = expandedSecond, onDismissRequest = { expandedSecond = false }) {
+                    filteredSecondStations.forEach { s ->
+                        DropdownMenuItem(text = { Text(s) }, onClick = {
+                            entry.secondStation = s
+                            entry.secondStationSearch = s
+                            expandedSecond = false
+                            onSecondStationChange()
+                        })
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Helper classes for UI
+data class UploadDialogJunctionError(
+    val firstStation: Boolean = false,
+    val survey: Boolean = false,
+    val secondStation: Boolean = false
+)
 
 data class JunctionData(val firstStation: String, val otherSurveyName: String, val secondStation: String)
 
@@ -1233,7 +1395,7 @@ suspend fun uploadSurveyToDrive(
     survey: SurveyInfo,
     newName: String,
     uploadGeopoint: Boolean,
-    junctionData: JunctionData?,
+    junctions: List<JunctionData>,
     onLog: (String, Color) -> Unit
 ) = withContext(Dispatchers.IO) {
     fun getLog(resId: Int, vararg args: Any): String = context.getString(resId, *args)
@@ -1439,7 +1601,8 @@ suspend fun uploadSurveyToDrive(
 
         var currentProjectPath = caveJsonObject.optString("projectFile")
         if (currentProjectPath.isEmpty()) {
-            currentProjectPath = "project/caveArchiveProject.tdconfig"
+            val safeArchiveName = archive.name.replace(Regex("[^a-zA-Z0-9]"), "_")
+            currentProjectPath = "project/$safeArchiveName.tdconfig"
         }
 
         val baseName = currentProjectPath.split("/").last().let { name ->
@@ -1463,8 +1626,8 @@ suspend fun uploadSurveyToDrive(
                 sb.append("source\n")
                 sb.append("  survey \"$baseName\"\n")
                 sb.append("    load \"$newName\" -color $color\n")
-                if (junctionData != null) {
-                    sb.append("    equate \"${junctionData.firstStation}@$newName\" \"${junctionData.secondStation}@${junctionData.otherSurveyName}\"\n")
+                junctions.forEach { j ->
+                    sb.append("    equate \"${j.firstStation}@$newName\" \"${j.secondStation}@${j.otherSurveyName}\"\n")
                 }
                 sb.append("  endsurvey\n")
                 sb.append("endsource")
@@ -1495,15 +1658,16 @@ suspend fun uploadSurveyToDrive(
                     if (insertIndex != -1) {
                         val color = (Math.random() * 16777215).toInt()
                         lines.add(insertIndex, "    load \"$newName\" -color $color")
-                        if (junctionData != null) {
-                            var equateIndex = lines.size - 1
-                            for (i in lines.indices.reversed()) if (lines[i].trim() == "endsurvey") {
-                                equateIndex = i; break
-                            }
+                        var equateIndex = lines.size - 1
+                        for (i in lines.indices.reversed()) if (lines[i].trim() == "endsurvey") {
+                            equateIndex = i; break
+                        }
+                        junctions.forEach { j ->
                             lines.add(
                                 equateIndex,
-                                "    equate \"${junctionData.firstStation}@$newName\" \"${junctionData.secondStation}@${junctionData.otherSurveyName}\""
+                                "    equate \"${j.firstStation}@$newName\" \"${j.secondStation}@${j.otherSurveyName}\""
                             )
+                            equateIndex++ // Important: move index forward for next equate
                         }
                     }
                     updatedTdContent = lines.joinToString("\n")
@@ -1552,6 +1716,92 @@ suspend fun uploadSurveyToDrive(
         } else {
             e.message ?: e.toString()
         }
+        withContext(Dispatchers.Main) { onLog(getLog(R.string.upload_error, msg), Color.Red) }
+    }
+}
+
+suspend fun uploadDemToDrive(
+    context: Context,
+    archive: ArchiveConfig,
+    fileUri: Uri,
+    fileName: String,
+    onLog: (String, Color) -> Unit
+) = withContext(Dispatchers.IO) {
+    fun getLog(resId: Int, vararg args: Any): String = context.getString(resId, *args)
+    try {
+        withContext(Dispatchers.Main) { onLog(getLog(R.string.upload_starting, fileName), Color.Cyan) }
+        val account = GoogleSignIn.getLastSignedInAccount(context) ?: return@withContext
+        val credential = GoogleAccountCredential.usingOAuth2(
+            context,
+            Collections.singleton(DriveScopes.DRIVE_FILE)
+        ).apply { selectedAccount = account.account }
+        val drive = Drive.Builder(
+            AndroidHttp.newCompatibleTransport(),
+            GsonFactory.getDefaultInstance(),
+            credential
+        ).setApplicationName("CaveArchive").build()
+
+        val folderId = (if (archive.url.contains("/folders/")) {
+            archive.url.split("/folders/").getOrNull(1)?.split("?")?.getOrNull(0)
+        } else if (archive.url.contains("id=")) {
+            archive.url.split("id=").getOrNull(1)?.split("&")?.getOrNull(0)
+        } else {
+            null
+        }) ?: return@withContext
+
+        val demFolderId = getOrCreateFolder(drive, folderId, "dem")
+        
+        withContext(Dispatchers.Main) { onLog(getLog(R.string.upload_dem), Color.Cyan) }
+        
+        // Use a safe temporary file name to avoid path issues
+        val safeTempName = "temp_upload_dem_${System.currentTimeMillis()}"
+        val tempFile = JFile(context.cacheDir, safeTempName)
+        context.contentResolver.openInputStream(fileUri)?.use { input ->
+            tempFile.outputStream().use { output ->
+                input.copyTo(output)
+            }
+        }
+
+        val cleanFileName = fileName.split("/").last()
+        val driveFileMetadata = File().apply { setName(cleanFileName); setParents(listOf(demFolderId)) }
+        val mediaContent = com.google.api.client.http.FileContent("application/octet-stream", tempFile)
+        val uploadedFile = drive.files().create(driveFileMetadata, mediaContent).setFields("id").execute()
+        
+        // Update caves JSON
+        val rootFiles = drive.files().list().setQ("'$folderId' in parents and trashed = false")
+            .setFields("files(id, name)").execute().files ?: emptyList()
+        val cavesJsonPattern = Regex("caves([0-9a-fA-F]{5})\\.json")
+        val cavesJsonFiles = rootFiles.mapNotNull { f ->
+            val match = cavesJsonPattern.matchEntire(f.name)
+            if (match != null) f to match.groupValues[1].toInt(16) else null
+        }.sortedByDescending { it.second }
+
+        val latestVersion = cavesJsonFiles.firstOrNull()?.second ?: 0
+        val nextVersion = latestVersion + 1
+        val nextName = "caves${nextVersion.toString(16).padStart(5, '0').uppercase()}.json"
+
+        val caveJsonObject = if (cavesJsonFiles.isNotEmpty()) {
+            val content = drive.files().get(cavesJsonFiles.first().first.id).executeMediaAsInputStream()
+                .bufferedReader(Charset.forName("UTF-8")).use { it.readText() }
+            JSONObject(content)
+        } else {
+            JSONObject().apply { put("caves", JSONArray()) }
+        }
+
+        caveJsonObject.put("demFile", "dem/$cleanFileName")
+
+        val jsonFile = JFile(context.cacheDir, nextName).apply { writeText(caveJsonObject.toString(3)) }
+        val meta = File().apply { setName(nextName); setParents(listOf(folderId)) }
+        drive.files().create(meta, com.google.api.client.http.FileContent("application/json", jsonFile)).execute()
+
+        tempFile.delete(); jsonFile.delete()
+        withContext(Dispatchers.Main) {
+            onLog(getLog(R.string.upload_completed_version, nextName), Color.Green)
+            onLog(getLog(R.string.upload_completed_success), Color.Green)
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+        val msg = if (e is GoogleJsonResponseException) "Drive Error: ${e.details?.message ?: e.message}" else e.message ?: e.toString()
         withContext(Dispatchers.Main) { onLog(getLog(R.string.upload_error, msg), Color.Red) }
     }
 }
@@ -2046,6 +2296,9 @@ suspend fun syncDriveFolderOAuth(
 
             val cavesFolderId = rootFiles.find { it.name.equals("caves", true) }?.id
 
+            val validCaveNames = mutableSetOf<String>()
+            val validFilesPaths = mutableSetOf<String>()
+
             val parentFolder = DocumentFile.fromTreeUri(context, localFolderUri)
                 ?: return@withContext false to "Local folder error"
             val dbDocFile = parentFolder.findFile("distox14.sqlite")
@@ -2077,6 +2330,7 @@ suspend fun syncDriveFolderOAuth(
                                 val sNameWithPath =
                                     cave.getString("shotsFile") 
                                 val sName = sNameWithPath.split("/").last()
+                                validCaveNames.add(sName)
 
                                 val vals = ContentValues().apply {
                                     put("name", name); put("day", cave.optString("day", ""))
@@ -2219,6 +2473,7 @@ suspend fun syncDriveFolderOAuth(
                 for (j in 0 until jsonArray.length()) {
                     if (checkCancelled()) break
                     val fullPath = jsonArray.getString(j) 
+                    validFilesPaths.add(fullPath)
                     val parts = fullPath.split("/")
                     if (parts.size != 2) continue
 
@@ -2311,6 +2566,56 @@ suspend fun syncDriveFolderOAuth(
             if (demFile.isNotEmpty()) syncFilesList(JSONArray().put(demFile), "DTM")
             val projectFile = caveJsonObject.optString("projectFile")
             if (projectFile.isNotEmpty()) syncFilesList(JSONArray().put(projectFile), "thconfig")
+
+            // --- CLEANUP PHASE ---
+            if (dbDocFile != null) {
+                val tempDb = JFile(context.cacheDir, "cleanup_temp.sqlite")
+                context.contentResolver.openInputStream(dbDocFile.uri)
+                    ?.use { input -> FileOutputStream(tempDb).use { input.copyTo(it) } }
+                
+                SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
+                    ensureCaveArchiveColumn(db)
+                    
+                    // 1. Cleanup Surveys (SQLite)
+                    db.query("CA_Surveys", arrayOf("file_name"), "archiveId = ?", arrayOf(archive.id.toString()), null, null, null).use { cursor ->
+                        while (cursor.moveToNext()) {
+                            val fileName = cursor.getString(0)
+                            if (!validCaveNames.contains(fileName)) {
+                                val surveyName = fileName.removeSuffix(".sqlite")
+                                db.delete("surveys", "name = ? AND archiveId = ?", arrayOf(surveyName, archive.id.toString()))
+                                db.delete("CA_Surveys", "file_name = ? AND archiveId = ?", arrayOf(fileName, archive.id.toString()))
+                                // Cascade delete shots/fixeds is handled by not being in surveys
+                                db.execSQL("DELETE FROM shots WHERE surveyId NOT IN (SELECT id FROM surveys)")
+                                db.execSQL("DELETE FROM fixeds WHERE surveyId NOT IN (SELECT id FROM surveys)")
+                            }
+                        }
+                    }
+
+                    // 2. Cleanup Files (DEMs, Projects)
+                    db.query("CA_Files", arrayOf("path", "local_path"), "archiveId = ?", arrayOf(archive.id.toString()), null, null, null).use { cursor ->
+                        while (cursor.moveToNext()) {
+                            val cloudPath = cursor.getString(0)
+                            val localPath = cursor.getString(1)
+                            if (!validFilesPaths.contains(cloudPath)) {
+                                // Delete local file
+                                if (!localPath.isNullOrEmpty()) {
+                                    val lpParts = localPath.split("/")
+                                    if (lpParts.size == 2) {
+                                        parentFolder.findFile(lpParts[0])?.findFile(lpParts[1])?.delete()
+                                    }
+                                }
+                                db.delete("CA_Files", "path = ? AND archiveId = ?", arrayOf(cloudPath, archive.id.toString()))
+                            }
+                        }
+                    }
+                }
+                
+                context.contentResolver.openOutputStream(dbDocFile.uri, "wt")?.use { output ->
+                    tempDb.inputStream().use { input -> input.copyTo(output) }
+                    output.flush()
+                }
+                tempDb.delete()
+            }
 
             return@withContext true to getLog(R.string.sync_completed)
         } catch (t: Throwable) {

@@ -57,7 +57,9 @@
     <string name="btn_save">Save</string>
 
     <!-- Upload Dialog -->
-    <string name="upload_title">Upload Survey</string>
+    <string name="upload_title">Upload</string>
+    <string name="option_upload_survey">Upload survey</string>
+    <string name="option_upload_dem">Upload DEM</string>
     <string name="label_select_survey">Select Survey:</string>
     <string name="label_new_name">New name</string>
     <string name="option_upload_geopoint">Upload geopoint</string>
@@ -67,6 +69,13 @@
     <string name="label_second_junction">Second junction point:</string>
     <string name="hint_search_station">Search station</string>
     <string name="btn_upload">Upload</string>
+    <string name="btn_add_junction">Add connection</string>
+    <string name="label_junction_number">Connection #%1$d</string>
+    <string name="desc_remove_junction">Remove connection</string>
+    <string name="label_select_dem">Select DEM file:</string>
+    <string name="btn_select_file">Select File</string>
+    <string name="dem_file_selected">Selected: %1$s</string>
+    <string name="dem_file_not_selected">No file selected</string>
 
     <!-- Logs and Messages -->
     <string name="log_folder_set">Folder set successfully</string>
@@ -105,6 +114,7 @@
     <string name="upload_cleaning">Cleaning old files in caves/ folder...</string>
     <string name="upload_duplicate_warning">WARNING: Duplicate %1$s remains in caves/!</string>
     <string name="upload_sqlite">Uploading new SQLite to caves/...</string>
+    <string name="upload_dem">Uploading DEM to dem/...</string>
     <string name="upload_version_created">Created version %1$s</string>
     <string name="upload_project_error">ERROR updating project: %1$s</string>
     <string name="upload_completed_version">Upload completed: version %1$s created.</string>
