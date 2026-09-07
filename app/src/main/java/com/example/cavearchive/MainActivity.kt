@@ -1,6 +1,8 @@
 package com.cavearchive.app
 
 import android.app.Application
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentValues
@@ -9,6 +11,7 @@ import android.content.Intent
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -42,6 +45,8 @@ import androidx.compose.material.icons.filled.FormatPaint
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material.icons.filled.SyncDisabled
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -93,6 +98,11 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.work.Constraints
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkManager
 import com.cavearchive.app.ui.theme.CaveArchiveTheme
 import com.google.android.gms.auth.api.signin.GoogleSignIn
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions
@@ -120,10 +130,11 @@ import java.nio.charset.Charset
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Collections
+import java.util.concurrent.TimeUnit
 import java.io.File as JFile
 
 data class LogMessage(val text: String, val color: Color, val time: String)
-data class ArchiveConfig(val id: Int = 0, val name: String, val url: String)
+data class ArchiveConfig(val id: Int = 0, val name: String, val url: String, val isAutoSync: Boolean = false)
 data class SurveyInfo(val id: Int, val name: String)
 
 sealed class ActiveDialog {
@@ -136,6 +147,7 @@ sealed class ActiveDialog {
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        createNotificationChannel()
         enableEdgeToEdge()
         setContent {
             CaveArchiveTheme {
@@ -143,11 +155,30 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // Request notification permission if needed (handled in UI for simplicity or here)
+        }
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val name = getString(R.string.channel_name)
+            val descriptionText = getString(R.string.channel_description)
+            val importance = NotificationManager.IMPORTANCE_DEFAULT
+            val channel = NotificationChannel("sync_channel", name, importance).apply {
+                description = descriptionText
+            }
+            val notificationManager: NotificationManager =
+                getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
 }
 
 private const val PREFS_NAME = "CaveArchivePrefs"
 private const val KEY_FOLDER_URI = "selected_folder_uri"
 private const val KEY_ARCHIVE_URL = "archive_url"
+private const val KEY_BACKGROUND_SYNC = "background_sync_enabled"
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val sharedPrefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -156,6 +187,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var wipeAllData by mutableStateOf(true)
     var archiveToWipe by mutableStateOf<ArchiveConfig?>(null)
     var showMenu by mutableStateOf(false)
+    var isBackgroundSyncEnabled by mutableStateOf(sharedPrefs.getBoolean(KEY_BACKGROUND_SYNC, false))
 
     var archives by mutableStateOf(emptyList<ArchiveConfig>())
     var selectedArchive by mutableStateOf<ArchiveConfig?>(null)
@@ -259,6 +291,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             archives = loaded
             
+            // Gestione scheduling automatica: se almeno uno ha auto-sync, attiva WorkManager
+            if (loaded.any { it.isAutoSync }) {
+                scheduleBackgroundSync()
+            } else {
+                cancelBackgroundSync()
+            }
+            
             if (selectedArchive == null || loaded.none { it.url == selectedArchive?.url }) {
                 selectedArchive = loaded.firstOrNull()
                 selectedArchive?.let { 
@@ -280,7 +319,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 isSyncing = true
                 addLog(getString(R.string.log_sync_started), Color.Cyan)
-                val (res, msg) = syncDriveFolderOAuth(context, archive, uri, ::addLog, ::updateLog)
+                val (res, msg, updates) = syncDriveFolderOAuth(context, archive, uri, ::addLog, ::updateLog)
                 isSyncing = false
                 addLog(msg, if (res) Color.Green else Color.Red)
             } catch (t: Throwable) {
@@ -319,6 +358,40 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             addLog(getString(R.string.log_logged_out), Color.Yellow)
         }
     }
+
+    fun toggleBackgroundSync() {
+        val newState = !isBackgroundSyncEnabled
+        sharedPrefs.edit { putBoolean(KEY_BACKGROUND_SYNC, newState) }
+        isBackgroundSyncEnabled = newState
+        if (newState) {
+            scheduleBackgroundSync()
+        } else {
+            cancelBackgroundSync()
+        }
+    }
+
+    private fun scheduleBackgroundSync() {
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .build()
+
+        val request = PeriodicWorkRequestBuilder<SyncWorker>(30, TimeUnit.MINUTES)
+            .setConstraints(constraints)
+            .build()
+
+        WorkManager.getInstance(getApplication())
+            .enqueueUniquePeriodicWork(
+                "CaveArchiveSync",
+                ExistingPeriodicWorkPolicy.KEEP,
+                request
+            )
+        addLog("Background sync scheduled (every 30m)", Color.Cyan)
+    }
+
+    private fun cancelBackgroundSync() {
+        WorkManager.getInstance(getApplication()).cancelUniqueWork("CaveArchiveSync")
+        addLog("Background sync disabled", Color.Yellow)
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -327,14 +400,6 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    val listState = rememberLazyListState()
-
-    LaunchedEffect(viewModel.logs.size) {
-        if (viewModel.logs.isNotEmpty()) {
-            listState.animateScrollToItem(viewModel.logs.size - 1)
-        }
-    }
-
     LaunchedEffect(viewModel.selectedFolderUri) {
         viewModel.refreshFolderContent(context)
     }
@@ -342,6 +407,21 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
     LaunchedEffect(viewModel.selectedArchive) {
         if (viewModel.isDbFound && (viewModel.selectedArchive == null || viewModel.selectedArchive?.url?.isBlank() == true)) {
             viewModel.addLog(context.getString(R.string.log_sync_disabled_no_selection), Color.Yellow)
+        }
+    }
+
+    // Richiesta permesso notifiche (Android 13+)
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (!isGranted) {
+            viewModel.addLog("Notification permission denied. Background sync status won't be shown.", Color.Yellow)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 
@@ -369,14 +449,115 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
         }
     }
 
+    MainScreenContent(
+        logs = viewModel.logs,
+        selectedFolderUri = viewModel.selectedFolderUri,
+        selectedArchive = viewModel.selectedArchive,
+        isDbFound = viewModel.isDbFound,
+        activeDialog = viewModel.activeDialog,
+        appVersion = viewModel.appVersion,
+        isSignedIn = viewModel.isSignedIn,
+        isSyncing = viewModel.isSyncing,
+        isSyncStopping = viewModel.syncJob?.isCancelled == true,
+        wipeAllData = viewModel.wipeAllData,
+        archiveToWipe = viewModel.archiveToWipe,
+        showMenu = viewModel.showMenu,
+        archives = viewModel.archives,
+        onActiveDialogChange = { viewModel.activeDialog = it },
+        onWipeAllDataChange = { viewModel.wipeAllData = it },
+        onArchiveToWipeChange = { viewModel.archiveToWipe = it },
+        onShowMenuChange = { viewModel.showMenu = it },
+        onSelectedArchiveChange = { arch ->
+            viewModel.selectedArchive = arch
+            if (arch != null) {
+                val sharedPrefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                sharedPrefs.edit { putString(KEY_ARCHIVE_URL, arch.url) }
+            }
+        },
+        onFolderRequest = { folderLauncher.launch(null) },
+        onStartSync = { viewModel.startSync(context) },
+        onSaveArchives = { newList ->
+            viewModel.saveAndRefreshArchives(context, newList)
+            viewModel.activeDialog = null
+        },
+        onWipeData = { viewModel.wipeData(context) },
+        onLogout = { viewModel.logout(context) },
+        onStopSync = { viewModel.syncJob?.cancel() },
+        onClearLogs = { viewModel.logs.clear() },
+        onCopyLogs = {
+            val content = viewModel.logs.joinToString("\n") { "[${it.time}] ${it.text}" }
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = ClipData.newPlainText("Console Logs", content)
+            clipboard.setPrimaryClip(clip)
+            Toast.makeText(context, context.getString(R.string.toast_logs_copied), Toast.LENGTH_SHORT).show()
+        },
+        onAddLog = { t, c -> viewModel.addLog(t, c) },
+        onOpenUrl = { url ->
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            context.startActivity(intent)
+        },
+        onLogin = {
+            val gso = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+                .requestEmail()
+                .requestScopes(
+                    Scope(DriveScopes.DRIVE)
+                ).build()
+            signInLauncher.launch(GoogleSignIn.getClient(context, gso).signInIntent)
+        }
+    )
+}
 
-    if (viewModel.activeDialog == ActiveDialog.Info) {
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MainScreenContent(
+    logs: List<LogMessage>,
+    selectedFolderUri: Uri?,
+    selectedArchive: ArchiveConfig?,
+    isDbFound: Boolean,
+    activeDialog: ActiveDialog?,
+    appVersion: String,
+    isSignedIn: Boolean,
+    isSyncing: Boolean,
+    isSyncStopping: Boolean,
+    wipeAllData: Boolean,
+    archiveToWipe: ArchiveConfig?,
+    showMenu: Boolean,
+    archives: List<ArchiveConfig>,
+    onActiveDialogChange: (ActiveDialog?) -> Unit,
+    onWipeAllDataChange: (Boolean) -> Unit,
+    onArchiveToWipeChange: (ArchiveConfig?) -> Unit,
+    onShowMenuChange: (Boolean) -> Unit,
+    onSelectedArchiveChange: (ArchiveConfig?) -> Unit,
+    onFolderRequest: () -> Unit,
+    onStartSync: () -> Unit,
+    onSaveArchives: (List<ArchiveConfig>) -> Unit,
+    onWipeData: () -> Unit,
+    onLogout: () -> Unit,
+    onStopSync: () -> Unit,
+    onClearLogs: () -> Unit,
+    onCopyLogs: () -> Unit,
+    onAddLog: (String, Color) -> Unit,
+    onOpenUrl: (String) -> Unit,
+    onLogin: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    val listState = rememberLazyListState()
+
+    LaunchedEffect(logs.size) {
+        if (logs.isNotEmpty()) {
+            listState.animateScrollToItem(logs.size - 1)
+        }
+    }
+
+    if (activeDialog == ActiveDialog.Info) {
         AlertDialog(
-            onDismissRequest = { viewModel.activeDialog = null },
+            onDismissRequest = { onActiveDialogChange(null) },
             title = { Text(stringResource(R.string.info_title)) },
             text = {
                 Column {
-                    Text(stringResource(R.string.info_version, viewModel.appVersion))
+                    Text(stringResource(R.string.info_version, appVersion))
                     Text(stringResource(R.string.info_release_date))
                     Text(stringResource(R.string.info_developer))
                     Row {
@@ -387,10 +568,7 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
                             fontWeight = FontWeight.Bold,
                             textDecoration = TextDecoration.Underline,
                             modifier = Modifier.clickable {
-                                val intent = Intent(Intent.ACTION_SENDTO).apply {
-                                    data = Uri.parse("mailto:simon.beatrice.lindner@gmail.com")
-                                }
-                                context.startActivity(intent)
+                                onOpenUrl("mailto:simon.beatrice.lindner@gmail.com")
                             }
                         )
                     }
@@ -403,25 +581,25 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
                 }
             },
             confirmButton = {
-                TextButton(onClick = { viewModel.activeDialog = null }) { Text(stringResource(R.string.btn_ok)) }
+                TextButton(onClick = { onActiveDialogChange(null) }) { Text(stringResource(R.string.btn_ok)) }
             }
         )
     }
 
-    if (viewModel.activeDialog == ActiveDialog.Wipe) {
+    if (activeDialog == ActiveDialog.Wipe) {
         AlertDialog(
-            onDismissRequest = { viewModel.activeDialog = null },
+            onDismissRequest = { onActiveDialogChange(null) },
             title = { Text(stringResource(R.string.wipe_title)) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(stringResource(R.string.wipe_confirmation))
                     
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Checkbox(checked = viewModel.wipeAllData, onCheckedChange = { viewModel.wipeAllData = it })
-                        Text(stringResource(R.string.wipe_all_data), modifier = Modifier.clickable { viewModel.wipeAllData = !viewModel.wipeAllData })
+                        Checkbox(checked = wipeAllData, onCheckedChange = { onWipeAllDataChange(it) })
+                        Text(stringResource(R.string.wipe_all_data), modifier = Modifier.clickable { onWipeAllDataChange(!wipeAllData) })
                     }
 
-                    if (!viewModel.wipeAllData) {
+                    if (!wipeAllData) {
                         var expanded by remember { mutableStateOf(false) }
                         Text(stringResource(R.string.wipe_select_archive), style = MaterialTheme.typography.labelLarge)
                         Box {
@@ -431,12 +609,12 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
                                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant, contentColor = MaterialTheme.colorScheme.onSurfaceVariant),
                                 shape = RoundedCornerShape(4.dp)
                             ) {
-                                Text(viewModel.archiveToWipe?.name ?: stringResource(R.string.select_archive), maxLines = 1, textAlign = TextAlign.Start, modifier = Modifier.fillMaxWidth())
+                                Text(archiveToWipe?.name ?: stringResource(R.string.select_archive), maxLines = 1, textAlign = TextAlign.Start, modifier = Modifier.fillMaxWidth())
                             }
                             DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                                viewModel.archives.forEach { arch ->
+                                archives.forEach { arch ->
                                     DropdownMenuItem(text = { Text(arch.name) }, onClick = {
-                                        viewModel.archiveToWipe = arch
+                                        onArchiveToWipeChange(arch)
                                         expanded = false
                                     })
                                 }
@@ -454,36 +632,35 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
             },
             confirmButton = {
                 TextButton(
-                    onClick = { viewModel.wipeData(context) }
+                    onClick = { onWipeData() }
                 ) { Text(stringResource(R.string.btn_confirm)) }
             },
             dismissButton = {
-                TextButton(onClick = { viewModel.activeDialog = null }) { Text(stringResource(R.string.btn_cancel)) }
+                TextButton(onClick = { onActiveDialogChange(null) }) { Text(stringResource(R.string.btn_cancel)) }
             }
         )
     }
 
-    if (viewModel.activeDialog == ActiveDialog.ManageArchives) {
+    if (activeDialog == ActiveDialog.ManageArchives) {
         ManageArchivesDialog(
-            initialArchives = viewModel.archives,
-            currentFolderUri = viewModel.selectedFolderUri,
-            isDbFound = viewModel.isDbFound,
-            onFolderRequest = { folderLauncher.launch(null) },
-            onDismiss = { viewModel.activeDialog = null },
+            initialArchives = archives,
+            currentFolderUri = selectedFolderUri,
+            isDbFound = isDbFound,
+            onFolderRequest = { onFolderRequest() },
+            onDismiss = { onActiveDialogChange(null) },
             onSave = { newList ->
-                viewModel.saveAndRefreshArchives(context, newList)
-                viewModel.activeDialog = null
+                onSaveArchives(newList)
             }
         )
     }
 
-    if (viewModel.activeDialog == ActiveDialog.Upload) {
+    if (activeDialog == ActiveDialog.Upload) {
         UploadDialog(
             context = context,
-            localFolderUri = viewModel.selectedFolderUri,
-            selectedArchive = viewModel.selectedArchive,
-            onDismiss = { viewModel.activeDialog = null },
-            onLog = { t, c -> viewModel.addLog(t, c) },
+            localFolderUri = selectedFolderUri,
+            selectedArchive = selectedArchive,
+            onDismiss = { onActiveDialogChange(null) },
+            onLog = { t, c -> onAddLog(t, c) },
             externalScope = scope
         )
     }
@@ -500,33 +677,34 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
                     )
                 },
                 actions = {
-                    IconButton(onClick = { viewModel.showMenu = true }) {
+                    IconButton(onClick = { onShowMenuChange(true) }) {
                         Icon(Icons.Default.MoreVert, contentDescription = null)
                     }
-                    DropdownMenu(expanded = viewModel.showMenu, onDismissRequest = { viewModel.showMenu = false }) {
+                    DropdownMenu(expanded = showMenu, onDismissRequest = { onShowMenuChange(false) }) {
                         DropdownMenuItem(
                             text = { Text(stringResource(R.string.menu_upload)) },
-                            onClick = { viewModel.showMenu = false; viewModel.activeDialog = ActiveDialog.Upload }
+                            onClick = { onShowMenuChange(false); onActiveDialogChange(ActiveDialog.Upload) },
+                            enabled = isSignedIn
                         )
                         DropdownMenuItem(
                             text = { Text(stringResource(R.string.menu_site)) },
                             onClick = {
-                                viewModel.showMenu = false
-                                val intent = Intent(Intent.ACTION_VIEW, Uri.parse("http://www.cavearchive.it/"))
-                                context.startActivity(intent)
+                                onShowMenuChange(false)
+                                onOpenUrl("http://www.cavearchive.it/")
                             }
                         )
                         DropdownMenuItem(
                             text = { Text(stringResource(R.string.menu_logout)) },
-                            onClick = { viewModel.logout(context) }
+                            onClick = { onLogout() },
+                            enabled = isSignedIn
                         )
                         DropdownMenuItem(
                             text = { Text(stringResource(R.string.menu_wipe_data)) },
-                            onClick = { viewModel.showMenu = false; viewModel.activeDialog = ActiveDialog.Wipe }
+                            onClick = { onShowMenuChange(false); onActiveDialogChange(ActiveDialog.Wipe) }
                         )
                         DropdownMenuItem(
                             text = { Text(stringResource(R.string.menu_info)) },
-                            onClick = { viewModel.showMenu = false; viewModel.activeDialog = ActiveDialog.Info }
+                            onClick = { onShowMenuChange(false); onActiveDialogChange(ActiveDialog.Info) }
                         )
                     }
                 }
@@ -548,35 +726,28 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
                 )
                 Spacer(Modifier.height(16.dp))
 
-                if (viewModel.isSyncing) {
+                if (isSyncing) {
                     CircularProgressIndicator()
-                    val isStopping = viewModel.syncJob?.isCancelled == true
-                    val status = if (isStopping) stringResource(R.string.status_stopping) else stringResource(R.string.status_syncing)
+                    val status = if (isSyncStopping) stringResource(R.string.status_stopping) else stringResource(R.string.status_syncing)
                     Text(status, modifier = Modifier.padding(top = 8.dp))
-                    if (!isStopping) {
+                    if (!isSyncStopping) {
                         Button(
                             onClick = { 
-                                viewModel.syncJob?.cancel()
+                                onStopSync()
                             },
                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                             modifier = Modifier.padding(top = 8.dp)
                         ) { Text(stringResource(R.string.btn_stop_sync)) }
                     }
                 } else {
-                    if (!viewModel.isSignedIn) {
+                    if (!isSignedIn) {
                         Button(onClick = {
-                            val gso = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
-                                .requestEmail()
-                                .requestScopes(
-                                    Scope(DriveScopes.DRIVE_READONLY),
-                                    Scope(DriveScopes.DRIVE_FILE)
-                                ).build()
-                            signInLauncher.launch(GoogleSignIn.getClient(context, gso).signInIntent)
+                            onLogin()
                         }) { Text(stringResource(R.string.btn_google_login)) }
                     } else {
                         Button(
-                            onClick = { viewModel.startSync(context) },
-                            enabled = viewModel.isDbFound && viewModel.selectedArchive != null && viewModel.selectedArchive?.url?.isNotBlank() == true,
+                            onClick = { onStartSync() },
+                            enabled = isDbFound && selectedArchive != null && selectedArchive.url.isNotBlank(),
                             modifier = Modifier
                                 .height(56.dp)
                                 .fillMaxWidth(0.6f)
@@ -591,7 +762,7 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
                 .background(Color.Black, RoundedCornerShape(8.dp))
                 .padding(8.dp)) {
                 LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
-                    items(viewModel.logs) { log ->
+                    items(logs) { log ->
                         Text("[${log.time}] ${log.text}", color = log.color, fontFamily = FontFamily.Monospace, fontSize = 10.sp)
                     }
                 }
@@ -600,13 +771,7 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     IconButton(
-                        onClick = {
-                            val content = viewModel.logs.joinToString("\n") { "[${it.time}] ${it.text}" }
-                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            val clip = ClipData.newPlainText("Console Logs", content)
-                            clipboard.setPrimaryClip(clip)
-                            Toast.makeText(context, context.getString(R.string.toast_logs_copied), Toast.LENGTH_SHORT).show()
-                        },
+                        onClick = { onCopyLogs() },
                         modifier = Modifier.size(32.dp)
                     ) {
                         Icon(
@@ -616,7 +781,7 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
                         )
                     }
                     IconButton(
-                        onClick = { viewModel.logs.clear() },
+                        onClick = { onClearLogs() },
                         modifier = Modifier.size(32.dp)
                     ) {
                         Icon(
@@ -640,27 +805,25 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
                                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant, contentColor = MaterialTheme.colorScheme.onSurfaceVariant),
                                 shape = RoundedCornerShape(4.dp)
                             ) {
-                                Text(viewModel.selectedArchive?.name ?: stringResource(R.string.select_archive), maxLines = 1, textAlign = TextAlign.Start, modifier = Modifier.fillMaxWidth())
+                                Text(selectedArchive?.name ?: stringResource(R.string.select_archive), maxLines = 1, textAlign = TextAlign.Start, modifier = Modifier.fillMaxWidth())
                             }
                             DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                                viewModel.archives.forEach { arch ->
+                                archives.forEach { arch ->
                                     DropdownMenuItem(text = { Text(arch.name) }, onClick = {
-                                        viewModel.selectedArchive = arch
-                                        val sharedPrefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                                        sharedPrefs.edit { putString(KEY_ARCHIVE_URL, arch.url) }
+                                        onSelectedArchiveChange(arch)
                                         expanded = false
                                     })
                                 }
                             }
                         }
-                        IconButton(onClick = { viewModel.activeDialog = ActiveDialog.ManageArchives }) {
+                        IconButton(onClick = { onActiveDialogChange(ActiveDialog.ManageArchives) }) {
                             Icon(Icons.Default.Settings, contentDescription = null)
                         }
                     }
 
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        text = stringResource(R.string.label_folder, viewModel.selectedFolderUri?.let { getDisplayName(it) } ?: stringResource(R.string.folder_not_selected)),
+                        text = stringResource(R.string.label_folder, selectedFolderUri?.let { getDisplayName(it) } ?: stringResource(R.string.folder_not_selected)),
                         style = MaterialTheme.typography.bodySmall,
                         maxLines = 1,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -692,7 +855,8 @@ fun ManageArchivesDialog(
         text = {
             Column(modifier = Modifier
                 .fillMaxWidth()
-                .height(400.dp)) {
+                .height(450.dp)) {
+                
                 Text(stringResource(R.string.label_storage_folder), style = MaterialTheme.typography.labelLarge)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -739,18 +903,49 @@ fun ManageArchivesDialog(
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
-                                IconButton(onClick = {
-                                    try {
-                                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(arch.url))
-                                        context.startActivity(intent)
-                                    } catch (e: Exception) {
-                                        Toast.makeText(context, context.getString(R.string.toast_cannot_open_url), Toast.LENGTH_SHORT).show()
+                                
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    IconButton(
+                                        onClick = {
+                                            list = list.map { 
+                                                if (it.id == arch.id && (it.id != 0 || it == arch)) it.copy(isAutoSync = !it.isAutoSync) else it 
+                                            }
+                                        },
+                                        modifier = Modifier.size(32.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = if (arch.isAutoSync) Icons.Default.Sync else Icons.Default.SyncDisabled,
+                                            contentDescription = "Toggle Auto-Sync",
+                                            tint = if (arch.isAutoSync) MaterialTheme.colorScheme.primary else Color.Gray,
+                                            modifier = Modifier.size(20.dp)
+                                        )
                                     }
-                                }) {
-                                    Icon(Icons.Default.Public, contentDescription = stringResource(R.string.desc_open_drive), tint = MaterialTheme.colorScheme.primary)
+
+                                    IconButton(
+                                        onClick = {
+                                            try {
+                                                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(arch.url))
+                                                context.startActivity(intent)
+                                            } catch (e: Exception) {
+                                                Toast.makeText(context, context.getString(R.string.toast_cannot_open_url), Toast.LENGTH_SHORT).show()
+                                            }
+                                        },
+                                        modifier = Modifier.size(32.dp)
+                                    ) {
+                                        Icon(Icons.Default.Public, contentDescription = stringResource(R.string.desc_open_drive), tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+                                    }
+
+                                    IconButton(onClick = { editingArchive = arch; showAddDialog = true }, modifier = Modifier.size(32.dp)) { 
+                                        Icon(Icons.Default.Edit, null, modifier = Modifier.size(20.dp)) 
+                                    }
+                                    
+                                    IconButton(onClick = { list = list.filter { it.id != arch.id || (it.id == 0 && it != arch) } }, modifier = Modifier.size(32.dp)) { 
+                                        Icon(Icons.Default.Delete, null, tint = Color.Red, modifier = Modifier.size(20.dp)) 
+                                    }
                                 }
-                                IconButton(onClick = { editingArchive = arch; showAddDialog = true }) { Icon(Icons.Default.Edit, null) }
-                                IconButton(onClick = { list = list.filter { it.id != arch.id || (it.id == 0 && it != arch) } }) { Icon(Icons.Default.Delete, null, tint = Color.Red) }
                             }
                             HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant)
                         }
@@ -775,6 +970,7 @@ fun ManageArchivesDialog(
     if (showAddDialog) {
         var name by remember { mutableStateOf(editingArchive?.name ?: "") }
         var url by remember { mutableStateOf(editingArchive?.url ?: "") }
+        var isAuto by remember { mutableStateOf(editingArchive?.isAutoSync ?: false) }
         AlertDialog(
             onDismissRequest = { showAddDialog = false },
             title = { Text(if (editingArchive == null) stringResource(R.string.dialog_new_archive) else stringResource(R.string.dialog_edit_archive)) },
@@ -782,12 +978,16 @@ fun ManageArchivesDialog(
                 Column {
                     OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text(stringResource(R.string.label_name)) })
                     OutlinedTextField(value = url, onValueChange = { url = it }, label = { Text(stringResource(R.string.label_drive_url)) })
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(checked = isAuto, onCheckedChange = { isAuto = it })
+                        Text("Auto-Sync (Background)")
+                    }
                 }
             },
             confirmButton = {
                 TextButton(onClick = {
                     if (name.isNotBlank() && url.isNotBlank()) {
-                        val newArch = ArchiveConfig(id = editingArchive?.id ?: 0, name = name, url = url)
+                        val newArch = ArchiveConfig(id = editingArchive?.id ?: 0, name = name, url = url, isAutoSync = isAuto)
                         list = if (editingArchive == null) list + newArch else list.map { if (it.id == editingArchive?.id) newArch else it }
                         showAddDialog = false
                     }
@@ -1405,7 +1605,7 @@ suspend fun uploadSurveyToDrive(
         val account = GoogleSignIn.getLastSignedInAccount(context) ?: return@withContext
         val credential = GoogleAccountCredential.usingOAuth2(
             context,
-            Collections.singleton(DriveScopes.DRIVE_FILE)
+            Collections.singleton(DriveScopes.DRIVE)
         ).apply { selectedAccount = account.account }
         val drive = Drive.Builder(
             AndroidHttp.newCompatibleTransport(),
@@ -1733,7 +1933,7 @@ suspend fun uploadDemToDrive(
         val account = GoogleSignIn.getLastSignedInAccount(context) ?: return@withContext
         val credential = GoogleAccountCredential.usingOAuth2(
             context,
-            Collections.singleton(DriveScopes.DRIVE_FILE)
+            Collections.singleton(DriveScopes.DRIVE)
         ).apply { selectedAccount = account.account }
         val drive = Drive.Builder(
             AndroidHttp.newCompatibleTransport(),
@@ -1819,7 +2019,7 @@ suspend fun loadSettings(context: Context, folderUri: Uri): List<ArchiveConfig> 
             }
 
             val result = mutableListOf<ArchiveConfig>()
-            SQLiteDatabase.openDatabase(tempDb.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
+            SQLiteDatabase.openDatabase(tempDb.absolutePath, null, SQLiteDatabase.OPEN_READWRITE)
                 .use { db ->
                     ensureCaveArchiveColumn(db)
                     db.query("CA_Archives", null, null, null, null, null, null).use { cursor ->
@@ -1828,7 +2028,8 @@ suspend fun loadSettings(context: Context, folderUri: Uri): List<ArchiveConfig> 
                                 ArchiveConfig(
                                     id = cursor.getInt(cursor.getColumnIndexOrThrow("id")),
                                     name = cursor.getString(cursor.getColumnIndexOrThrow("name")),
-                                    url = cursor.getString(cursor.getColumnIndexOrThrow("url"))
+                                    url = cursor.getString(cursor.getColumnIndexOrThrow("url")),
+                                    isAutoSync = cursor.getInt(cursor.getColumnIndexOrThrow("is_auto_sync")) == 1
                                 )
                             )
                         }
@@ -1866,6 +2067,7 @@ suspend fun saveSettingsSuspend(context: Context, folderUri: Uri, archives: List
                             val values = ContentValues().apply {
                                 put("name", archive.name)
                                 put("url", archive.url)
+                                put("is_auto_sync", if (archive.isAutoSync) 1 else 0)
                                 if (archive.id > 0) put("id", archive.id)
                             }
                             db.insert("CA_Archives", null, values)
@@ -2086,10 +2288,18 @@ fun ensureCaveArchiveColumn(db: SQLiteDatabase) {
             // Table might not exist yet
         }
     }
-    db.execSQL("CREATE TABLE IF NOT EXISTS CA_Archives (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT)")
+    db.execSQL("CREATE TABLE IF NOT EXISTS CA_Archives (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT, is_auto_sync INTEGER DEFAULT 0)")
     db.execSQL("CREATE TABLE IF NOT EXISTS CA_Surveys (id INTEGER PRIMARY KEY AUTOINCREMENT, archiveId INTEGER, file_name TEXT, drive_id TEXT, modified_time TEXT)")
     db.execSQL("CREATE TABLE IF NOT EXISTS CA_Files (id INTEGER PRIMARY KEY AUTOINCREMENT, archiveId INTEGER, path TEXT, drive_id TEXT, modified_time TEXT)")
-    
+
+    try {
+        val cursor = db.rawQuery("SELECT * FROM CA_Archives LIMIT 0", null)
+        if (cursor.getColumnIndex("is_auto_sync") == -1) {
+            db.execSQL("ALTER TABLE CA_Archives ADD COLUMN is_auto_sync INTEGER DEFAULT 0")
+        }
+        cursor.close()
+    } catch (e: Exception) {}
+
     try {
         val cursor = db.rawQuery("SELECT * FROM CA_Files LIMIT 0", null)
         if (cursor.getColumnIndex("local_path") == -1) {
@@ -2179,7 +2389,7 @@ suspend fun syncDriveFolderOAuth(
         localFolderUri: Uri,
         onLog: (String, Color) -> Unit,
         onProgressLog: (String, Color) -> Unit
-    ): Pair<Boolean, String> {
+    ): Triple<Boolean, String, Int> {
         return withContext(Dispatchers.IO) {
         suspend fun safeLog(text: String, color: Color = Color.White) =
             withContext(Dispatchers.Main) { onLog(text, color) }
@@ -2254,10 +2464,10 @@ suspend fun syncDriveFolderOAuth(
 
         try {
             val account = GoogleSignIn.getLastSignedInAccount(context)
-                ?: return@withContext false to context.getString(R.string.btn_google_login)
+                ?: return@withContext Triple(false, context.getString(R.string.btn_google_login), 0)
             val credential = GoogleAccountCredential.usingOAuth2(
                 context,
-                Collections.singleton(DriveScopes.DRIVE_READONLY)
+                Collections.singleton(DriveScopes.DRIVE)
             ).apply { selectedAccount = account.account }
             val drive = Drive.Builder(
                 AndroidHttp.newCompatibleTransport(),
@@ -2271,7 +2481,7 @@ suspend fun syncDriveFolderOAuth(
                 else if (archive.url.contains("id=")) archive.url.split("id=").getOrNull(1)
                     ?.split("&")?.getOrNull(0)
                 else null
-            if (folderId == null) return@withContext false to getLog(R.string.sync_error_invalid_url)
+            if (folderId == null) return@withContext Triple(false, getLog(R.string.sync_error_invalid_url), 0)
 
             safeLog(getLog(R.string.sync_connecting), Color.Cyan)
             val rootFiles = runWithRetry("file list") {
@@ -2284,7 +2494,7 @@ suspend fun syncDriveFolderOAuth(
                 val match = cavesJsonPattern.matchEntire(f.name)
                 if (match != null) f to match.groupValues[1].toInt(16) else null
             }.maxByOrNull { it.second }?.first
-                ?: return@withContext false to getLog(R.string.sync_config_not_found)
+                ?: return@withContext Triple(false, getLog(R.string.sync_config_not_found), 0)
 
             safeLog(getLog(R.string.sync_using_config, latestCavesFile.name), Color.Green)
             val jsonStr = runWithRetry("download ${latestCavesFile.name}") {
@@ -2300,10 +2510,10 @@ suspend fun syncDriveFolderOAuth(
             val validFilesPaths = mutableSetOf<String>()
 
             val parentFolder = DocumentFile.fromTreeUri(context, localFolderUri)
-                ?: return@withContext false to "Local folder error"
+                ?: return@withContext Triple(false, "Local folder error", 0)
             val dbDocFile = parentFolder.findFile("distox14.sqlite")
 
-            var updatedCavesCount = 0
+            var totalUpdates = 0
 
             if (dbDocFile != null) {
                 val suffix = System.currentTimeMillis()
@@ -2438,7 +2648,7 @@ suspend fun syncDriveFolderOAuth(
                                                 } while (sc.moveToNext())
                                             }
                                         }
-                                        tShots.delete(); updatedCavesCount++
+                                        tShots.delete(); totalUpdates++
                                     }
                                 } else {
                                     safeLog(getLog(R.string.sync_error_shots_not_found, sName), Color.Red)
@@ -2454,7 +2664,7 @@ suspend fun syncDriveFolderOAuth(
                             context.contentResolver.openOutputStream(dbDocFile.uri, "wt")?.use { out ->
                                 tempDb.inputStream().use { it.copyTo(out) }; out.flush()
                             }
-                            safeLog(getLog(R.string.sync_db_updated, updatedCavesCount), Color.Green)
+                            safeLog(getLog(R.string.sync_db_updated, totalUpdates), Color.Green)
                         }
                     }
                 } catch (e: Exception) {
@@ -2552,6 +2762,7 @@ suspend fun syncDriveFolderOAuth(
                                             put("modified_time", currentModifiedTime); put("local_path", "$localDirName/$localName")
                                         })
                                     )
+                                    totalUpdates++
                                 }
                                 tempDownloadFile.delete()
                             }
@@ -2587,6 +2798,7 @@ suspend fun syncDriveFolderOAuth(
                                 // Cascade delete shots/fixeds is handled by not being in surveys
                                 db.execSQL("DELETE FROM shots WHERE surveyId NOT IN (SELECT id FROM surveys)")
                                 db.execSQL("DELETE FROM fixeds WHERE surveyId NOT IN (SELECT id FROM surveys)")
+                                totalUpdates++
                             }
                         }
                     }
@@ -2605,6 +2817,7 @@ suspend fun syncDriveFolderOAuth(
                                     }
                                 }
                                 db.delete("CA_Files", "path = ? AND archiveId = ?", arrayOf(cloudPath, archive.id.toString()))
+                                totalUpdates++
                             }
                         }
                     }
@@ -2617,10 +2830,10 @@ suspend fun syncDriveFolderOAuth(
                 tempDb.delete()
             }
 
-            return@withContext true to getLog(R.string.sync_completed)
+            return@withContext Triple(true, getLog(R.string.sync_completed), totalUpdates)
         } catch (t: Throwable) {
-            if (t is kotlinx.coroutines.CancellationException) return@withContext false to getLog(R.string.sync_interrupted)
-            return@withContext false to getLog(R.string.sync_error, t.localizedMessage ?: "")
+            if (t is kotlinx.coroutines.CancellationException) return@withContext Triple(false, getLog(R.string.sync_interrupted), 0)
+            return@withContext Triple(false, getLog(R.string.sync_error, t.localizedMessage ?: ""), 0)
         }
     }
 }
@@ -2692,5 +2905,37 @@ suspend fun updateFilesInventorySuspend(
 @Preview(showBackground = true)
 @Composable
 fun MainScreenPreview() {
-    CaveArchiveTheme { MainScreen() }
+    CaveArchiveTheme {
+        MainScreenContent(
+            logs = listOf(LogMessage("12:00", Color.White, "Preview log")),
+            selectedFolderUri = null,
+            selectedArchive = null,
+            isDbFound = true,
+            activeDialog = null,
+            appVersion = "1.0.0",
+            isSignedIn = true,
+            isSyncing = false,
+            isSyncStopping = false,
+            wipeAllData = false,
+            archiveToWipe = null,
+            showMenu = false,
+            archives = emptyList(),
+            onActiveDialogChange = {},
+            onWipeAllDataChange = {},
+            onArchiveToWipeChange = {},
+            onShowMenuChange = {},
+            onSelectedArchiveChange = {},
+            onFolderRequest = {},
+            onStartSync = {},
+            onSaveArchives = {},
+            onWipeData = {},
+            onLogout = {},
+            onStopSync = {},
+            onClearLogs = {},
+            onCopyLogs = {},
+            onAddLog = { _, _ -> },
+            onOpenUrl = {},
+            onLogin = {}
+        )
+    }
 }

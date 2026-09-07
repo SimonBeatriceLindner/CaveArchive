@@ -127,4 +127,10 @@
     <string name="wipe_data_deleted">Deleted %1$d surveys, %2$d shots and %3$d fixed points.</string>
     <string name="wipe_success">Wipe completed successfully.</string>
     <string name="wipe_error">Wipe error: %1$s</string>
+
+    <!-- Notification Channel -->
+    <string name="channel_name">CaveArchive Sync</string>
+    <string name="channel_description">Notifications for background synchronization</string>
+    <string name="label_background_sync">Background Synchronization</string>
+    <string name="desc_background_sync">Checks for updates every 30 minutes</string>
 </resources>
