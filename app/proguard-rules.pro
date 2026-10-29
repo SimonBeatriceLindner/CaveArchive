@@ -8,11 +8,7 @@
 # Keep Line Numbers for easier debugging of crashes in production
 -keepattributes SourceFile,LineNumberTable
 
-# --- Google API Client & Drive API ---
--keep class com.google.api.client.** { *; }
--keep interface com.google.api.client.** { *; }
--keep class com.google.api.services.drive.** { *; }
--keep interface com.google.api.services.drive.** { *; }
+
 
 # --- Gson / JSON ---
 # Keep classes used for JSON serialization/deserialization
@@ -27,10 +23,7 @@
 -dontwarn com.google.common.**
 -keep class com.google.common.** { *; }
 
-# --- Generic reflection rules for Google Libraries ---
--keepclassmembers class * {
-  @com.google.api.client.util.Key <fields>;
-}
+
 -dontwarn javax.annotation.**
 -dontwarn javax.inject.**
 -dontwarn sun.misc.Unsafe
@@ -39,3 +32,19 @@
 -dontwarn javax.naming.**
 -dontwarn org.ietf.jgss.**
 -dontwarn org.apache.http.**
+
+# --- MSAL & Azure Identity ---
+-dontwarn com.google.crypto.tink.subtle.**
+-dontwarn com.microsoft.device.display.**
+-dontwarn com.microsoft.identity.client.**
+-keep class com.microsoft.identity.client.** { *; }
+
+# --- Microsoft Graph & Kiota & Reactor ---
+-dontwarn io.micrometer.context.**
+-dontwarn reactor.blockhound.integration.**
+-dontwarn reactor.core.publisher.**
+-dontwarn reactor.util.context.**
+-dontwarn com.microsoft.graph.**
+-dontwarn com.microsoft.kiota.**
+-keep class com.microsoft.graph.** { *; }
+-keep class com.microsoft.kiota.** { *; }

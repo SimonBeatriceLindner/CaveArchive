@@ -24,6 +24,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -38,6 +39,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
@@ -89,6 +91,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -104,16 +107,17 @@ import androidx.work.NetworkType
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import com.cavearchive.app.ui.theme.CaveArchiveTheme
-import com.google.android.gms.auth.api.signin.GoogleSignIn
-import com.google.android.gms.auth.api.signin.GoogleSignInOptions
-import com.google.android.gms.common.api.Scope
-import com.google.api.client.extensions.android.http.AndroidHttp
-import com.google.api.client.googleapis.extensions.android.gms.auth.GoogleAccountCredential
-import com.google.api.client.googleapis.json.GoogleJsonResponseException
-import com.google.api.client.json.gson.GsonFactory
-import com.google.api.services.drive.Drive
-import com.google.api.services.drive.DriveScopes
-import com.google.api.services.drive.model.File
+import com.microsoft.identity.client.AuthenticationCallback
+import com.microsoft.identity.client.IAccount
+import com.microsoft.identity.client.IAuthenticationResult
+import com.microsoft.identity.client.IPublicClientApplication
+import com.microsoft.identity.client.ISingleAccountPublicClientApplication
+import com.microsoft.identity.client.PublicClientApplication
+import com.microsoft.identity.client.exception.MsalException
+import com.microsoft.graph.serviceclient.GraphServiceClient
+import com.microsoft.kiota.authentication.AccessTokenProvider
+import com.microsoft.kiota.authentication.AllowedHostsValidator
+import com.microsoft.kiota.authentication.BaseBearerTokenAuthenticationProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -123,6 +127,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
+import kotlin.coroutines.resume
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.FileOutputStream
@@ -142,6 +147,7 @@ sealed class ActiveDialog {
     object Wipe : ActiveDialog()
     object ManageArchives : ActiveDialog()
     object Upload : ActiveDialog()
+    object OneDriveNotice : ActiveDialog()
 }
 
 class MainActivity : ComponentActivity() {
@@ -179,11 +185,14 @@ private const val PREFS_NAME = "CaveArchivePrefs"
 private const val KEY_FOLDER_URI = "selected_folder_uri"
 private const val KEY_ARCHIVE_URL = "archive_url"
 private const val KEY_BACKGROUND_SYNC = "background_sync_enabled"
+private const val KEY_DONT_SHOW_ONEDRIVE_NOTICE = "dont_show_onedrive_notice"
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val sharedPrefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    var activeDialog by mutableStateOf<ActiveDialog?>(null)
+    var activeDialog by mutableStateOf<ActiveDialog?>(
+        if (!sharedPrefs.getBoolean(KEY_DONT_SHOW_ONEDRIVE_NOTICE, false)) ActiveDialog.OneDriveNotice else null
+    )
     var wipeAllData by mutableStateOf(true)
     var archiveToWipe by mutableStateOf<ArchiveConfig?>(null)
     var showMenu by mutableStateOf(false)
@@ -194,7 +203,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     var isSyncing by mutableStateOf(false)
     var syncJob by mutableStateOf<Job?>(null)
-    var isSignedIn by mutableStateOf(GoogleSignIn.getLastSignedInAccount(application) != null)
+    var msalApp: ISingleAccountPublicClientApplication? = null
+    var isSignedIn by mutableStateOf(false)
     var isDbFound by mutableStateOf(false)
 
     val logs = mutableStateListOf<LogMessage>()
@@ -319,7 +329,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 isSyncing = true
                 addLog(getString(R.string.log_sync_started), Color.Cyan)
-                val (res, msg, updates) = syncDriveFolderOAuth(context, archive, uri, ::addLog, ::updateLog)
+                val (res, msg, updates) = syncOneDriveFolder(context, msalApp, archive, uri, ::addLog, ::updateLog)
                 isSyncing = false
                 addLog(msg, if (res) Color.Green else Color.Red)
             } catch (t: Throwable) {
@@ -350,13 +360,103 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun initMsal(context: Context) {
+        if (msalApp != null) return
+        PublicClientApplication.createSingleAccountPublicClientApplication(
+            context.applicationContext,
+            R.raw.msal_config,
+            object : IPublicClientApplication.ISingleAccountApplicationCreatedListener {
+                override fun onCreated(application: ISingleAccountPublicClientApplication) {
+                    msalApp = application
+                    application.getCurrentAccountAsync(object : ISingleAccountPublicClientApplication.CurrentAccountCallback {
+                        override fun onAccountLoaded(activeAccount: IAccount?) {
+                            isSignedIn = (activeAccount != null)
+                        }
+
+                        override fun onAccountChanged(priorAccount: IAccount?, currentAccount: IAccount?) {
+                            isSignedIn = (currentAccount != null)
+                        }
+
+                        override fun onError(exception: MsalException) {
+                            isSignedIn = false
+                        }
+                    })
+                }
+
+                override fun onError(exception: MsalException) {
+                    addLog("MSAL Init Error: ${exception.message}", Color.Red)
+                }
+            }
+        )
+    }
+
+    fun loginOneDrive(activity: android.app.Activity) {
+        val app = msalApp
+        if (app == null) {
+            addLog(getString(R.string.log_msal_not_initialized), Color.Red)
+            return
+        }
+
+        app.getCurrentAccountAsync(object : ISingleAccountPublicClientApplication.CurrentAccountCallback {
+            override fun onAccountLoaded(activeAccount: IAccount?) {
+                if (activeAccount != null) {
+                    isSignedIn = true
+                    addLog(getString(R.string.log_onedrive_login_success), Color.Green)
+                } else {
+                    startSignIn(app, activity)
+                }
+            }
+
+            override fun onAccountChanged(priorAccount: IAccount?, currentAccount: IAccount?) {
+                isSignedIn = (currentAccount != null)
+            }
+
+            override fun onError(exception: MsalException) {
+                startSignIn(app, activity)
+            }
+        })
+    }
+
+    private fun startSignIn(app: ISingleAccountPublicClientApplication, activity: android.app.Activity) {
+        val scopes = arrayOf("Files.ReadWrite", "User.Read")
+        app.signIn(activity, null, scopes, object : AuthenticationCallback {
+            override fun onSuccess(authenticationResult: IAuthenticationResult) {
+                isSignedIn = true
+                addLog(getString(R.string.log_onedrive_login_success), Color.Green)
+            }
+
+            override fun onError(exception: MsalException) {
+                addLog(getString(R.string.log_onedrive_login_error, exception.message ?: ""), Color.Red)
+            }
+
+            override fun onCancel() {
+                addLog(getString(R.string.log_login_cancelled), Color.Yellow)
+            }
+        })
+    }
+
     fun logout(context: Context) {
         showMenu = false
-        val client = GoogleSignIn.getClient(context, GoogleSignInOptions.DEFAULT_SIGN_IN)
-        client.signOut().addOnCompleteListener {
+        val app = msalApp
+        if (app != null) {
+            app.signOut(object : ISingleAccountPublicClientApplication.SignOutCallback {
+                override fun onSignOut() {
+                    isSignedIn = false
+                    addLog(getString(R.string.log_logged_out), Color.Yellow)
+                }
+
+                override fun onError(exception: MsalException) {
+                    addLog(getString(R.string.log_error_general, exception.message ?: ""), Color.Red)
+                }
+            })
+        } else {
             isSignedIn = false
             addLog(getString(R.string.log_logged_out), Color.Yellow)
         }
+    }
+
+    fun setDontShowOneDriveNotice(dontShowAgain: Boolean) {
+        sharedPrefs.edit { putBoolean(KEY_DONT_SHOW_ONEDRIVE_NOTICE, dontShowAgain) }
     }
 
     fun toggleBackgroundSync() {
@@ -398,7 +498,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 @Composable
 fun MainScreen(viewModel: MainViewModel = viewModel()) {
     val context = LocalContext.current
+    val activity = context as? android.app.Activity
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        viewModel.initMsal(context)
+    }
 
     LaunchedEffect(viewModel.selectedFolderUri) {
         viewModel.refreshFolderContent(context)
@@ -422,18 +527,6 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
-        }
-    }
-
-    val signInLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        val task = GoogleSignIn.getSignedInAccountFromIntent(result.data)
-        if (task.isSuccessful) {
-            viewModel.isSignedIn = true
-            viewModel.addLog(context.getString(R.string.log_login_success), Color.Green)
-        } else {
-            viewModel.addLog(context.getString(R.string.log_login_error, task.exception?.message ?: ""), Color.Red)
         }
     }
 
@@ -464,6 +557,7 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
         showMenu = viewModel.showMenu,
         archives = viewModel.archives,
         onActiveDialogChange = { viewModel.activeDialog = it },
+        onSetDontShowOneDriveNotice = { dontShow -> viewModel.setDontShowOneDriveNotice(dontShow) },
         onWipeAllDataChange = { viewModel.wipeAllData = it },
         onArchiveToWipeChange = { viewModel.archiveToWipe = it },
         onShowMenuChange = { viewModel.showMenu = it },
@@ -497,12 +591,7 @@ fun MainScreen(viewModel: MainViewModel = viewModel()) {
             context.startActivity(intent)
         },
         onLogin = {
-            val gso = GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
-                .requestEmail()
-                .requestScopes(
-                    Scope(DriveScopes.DRIVE)
-                ).build()
-            signInLauncher.launch(GoogleSignIn.getClient(context, gso).signInIntent)
+            activity?.let { viewModel.loginOneDrive(it) }
         }
     )
 }
@@ -524,6 +613,7 @@ fun MainScreenContent(
     showMenu: Boolean,
     archives: List<ArchiveConfig>,
     onActiveDialogChange: (ActiveDialog?) -> Unit,
+    onSetDontShowOneDriveNotice: (Boolean) -> Unit = {},
     onWipeAllDataChange: (Boolean) -> Unit,
     onArchiveToWipeChange: (ArchiveConfig?) -> Unit,
     onShowMenuChange: (Boolean) -> Unit,
@@ -665,6 +755,17 @@ fun MainScreenContent(
         )
     }
 
+    if (activeDialog == ActiveDialog.OneDriveNotice) {
+        OneDriveNoticeDialog(
+            onDismiss = { dontShowAgain ->
+                if (dontShowAgain) {
+                    onSetDontShowOneDriveNotice(true)
+                }
+                onActiveDialogChange(null)
+            }
+        )
+    }
+
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         topBar = {
@@ -687,13 +788,6 @@ fun MainScreenContent(
                             enabled = isSignedIn
                         )
                         DropdownMenuItem(
-                            text = { Text(stringResource(R.string.menu_site)) },
-                            onClick = {
-                                onShowMenuChange(false)
-                                onOpenUrl("http://www.cavearchive.it/")
-                            }
-                        )
-                        DropdownMenuItem(
                             text = { Text(stringResource(R.string.menu_logout)) },
                             onClick = { onLogout() },
                             enabled = isSignedIn
@@ -701,6 +795,13 @@ fun MainScreenContent(
                         DropdownMenuItem(
                             text = { Text(stringResource(R.string.menu_wipe_data)) },
                             onClick = { onShowMenuChange(false); onActiveDialogChange(ActiveDialog.Wipe) }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.menu_site)) },
+                            onClick = {
+                                onShowMenuChange(false)
+                                onOpenUrl("http://www.cavearchive.it/")
+                            }
                         )
                         DropdownMenuItem(
                             text = { Text(stringResource(R.string.menu_info)) },
@@ -743,7 +844,7 @@ fun MainScreenContent(
                     if (!isSignedIn) {
                         Button(onClick = {
                             onLogin()
-                        }) { Text(stringResource(R.string.btn_google_login)) }
+                        }) { Text(stringResource(R.string.btn_onedrive_login)) }
                     } else {
                         Button(
                             onClick = { onStartSync() },
@@ -802,10 +903,28 @@ fun MainScreenContent(
                             Button(
                                 onClick = { expanded = true },
                                 modifier = Modifier.fillMaxWidth(),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant, contentColor = MaterialTheme.colorScheme.onSurfaceVariant),
                                 shape = RoundedCornerShape(4.dp)
                             ) {
-                                Text(selectedArchive?.name ?: stringResource(R.string.select_archive), maxLines = 1, textAlign = TextAlign.Start, modifier = Modifier.fillMaxWidth())
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(
+                                        text = selectedArchive?.name ?: stringResource(R.string.select_archive),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        textAlign = TextAlign.Start,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Spacer(Modifier.width(4.dp))
+                                    Icon(
+                                        imageVector = Icons.Default.ArrowDropDown,
+                                        contentDescription = null
+                                    )
+                                }
                             }
                             DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
                                 archives.forEach { arch ->
@@ -1513,19 +1632,156 @@ suspend fun loadSurveysFromDb(context: Context, folderUri: Uri): List<SurveyInfo
     list
 }
 
-fun getOrCreateFolder(drive: Drive, parentId: String, name: String): String {
-    val list = drive.files().list()
-        .setQ("'$parentId' in parents and name = '$name' and mimeType = 'application/vnd.google-apps.folder' and trashed = false")
-        .execute().files ?: emptyList()
-    if (list.isNotEmpty()) return list[0].id
-    val meta = File().apply {
-        setName(name); setMimeType("application/vnd.google-apps.folder"); setParents(
-        listOf(
-            parentId
-        )
-    )
+fun getOrCreateOneDriveFolder(token: String, parentIdOrUrl: String, folderName: String): String {
+    val existingItems = listOneDriveFolderChildren(token, parentIdOrUrl)
+    val existingFolder = existingItems.find { it.name.equals(folderName, ignoreCase = true) && it.isFolder }
+    if (existingFolder != null) return existingFolder.id
+
+    val parentEndpoint = when {
+        parentIdOrUrl.startsWith("http://") || parentIdOrUrl.startsWith("https://") -> {
+            val encodedUrl = "u!" + android.util.Base64.encodeToString(
+                parentIdOrUrl.toByteArray(Charsets.UTF_8),
+                android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP
+            )
+            "https://graph.microsoft.com/v1.0/shares/$encodedUrl/driveItem/children"
+        }
+        parentIdOrUrl.contains("/") -> {
+            val cleanPath = parentIdOrUrl.trim('/').split("/").joinToString("/") { encodeFileName(it) }
+            "https://graph.microsoft.com/v1.0/me/drive/root:/$cleanPath:/children"
+        }
+        else -> {
+            "https://graph.microsoft.com/v1.0/me/drive/items/$parentIdOrUrl/children"
+        }
     }
-    return drive.files().create(meta).setFields("id").execute().id
+
+    val url = java.net.URL(parentEndpoint)
+    val conn = url.openConnection() as java.net.HttpURLConnection
+    conn.requestMethod = "POST"
+    conn.connectTimeout = 15000
+    conn.readTimeout = 30000
+    conn.setRequestProperty("Authorization", "Bearer $token")
+    conn.setRequestProperty("Content-Type", "application/json")
+    conn.doOutput = true
+
+    val body = JSONObject().apply {
+        put("name", folderName)
+        put("folder", JSONObject())
+        put("@microsoft.graph.conflictBehavior", "replace")
+    }
+
+    val bodyBytes = body.toString().toByteArray(Charsets.UTF_8)
+    conn.setFixedLengthStreamingMode(bodyBytes.size)
+    conn.outputStream.use { it.write(bodyBytes) }
+
+    if (conn.responseCode == 200 || conn.responseCode == 201) {
+        val res = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        return JSONObject(res).getString("id")
+    } else {
+        val errText = try { conn.errorStream?.bufferedReader()?.use { it.readText() } } catch (e: Exception) { null }
+        throw Exception("Error creating folder $folderName: HTTP ${conn.responseCode} ${errText ?: ""}")
+    }
+}
+
+fun encodeFileName(fileName: String): String {
+    return java.net.URLEncoder.encode(fileName, "UTF-8")
+        .replace("+", "%20")
+        .replace("(", "%28")
+        .replace(")", "%29")
+        .replace("'", "%27")
+        .replace("!", "%21")
+        .replace("*", "%2A")
+}
+
+fun resolveOneDriveFolderId(token: String, folderIdOrUrl: String): String {
+    val clean = folderIdOrUrl.trim()
+    if (clean.isBlank()) return ""
+
+    if (!clean.startsWith("http://") && !clean.startsWith("https://") && !clean.contains("/")) {
+        return clean
+    }
+
+    if (clean.startsWith("http://") || clean.startsWith("https://")) {
+        val encodedUrl = "u!" + android.util.Base64.encodeToString(
+            clean.toByteArray(Charsets.UTF_8),
+            android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP
+        )
+        val endpoint = "https://graph.microsoft.com/v1.0/shares/$encodedUrl/driveItem"
+        val url = java.net.URL(endpoint)
+        val conn = url.openConnection() as java.net.HttpURLConnection
+        conn.requestMethod = "GET"
+        conn.connectTimeout = 15000
+        conn.readTimeout = 30000
+        conn.setRequestProperty("Authorization", "Bearer $token")
+        conn.setRequestProperty("Accept", "application/json")
+
+        if (conn.responseCode == 200) {
+            val responseText = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            return JSONObject(responseText).getString("id")
+        } else {
+            val errText = try { conn.errorStream?.bufferedReader()?.use { it.readText() } } catch (e: Exception) { null }
+            throw Exception("Cannot resolve OneDrive folder link: HTTP ${conn.responseCode} ${errText ?: ""}")
+        }
+    }
+
+    val cleanPath = clean.trim('/').split("/").joinToString("/") { encodeFileName(it) }
+    val endpoint = "https://graph.microsoft.com/v1.0/me/drive/root:/$cleanPath"
+    val url = java.net.URL(endpoint)
+    val conn = url.openConnection() as java.net.HttpURLConnection
+    conn.requestMethod = "GET"
+    conn.connectTimeout = 15000
+    conn.readTimeout = 30000
+    conn.setRequestProperty("Authorization", "Bearer $token")
+    conn.setRequestProperty("Accept", "application/json")
+
+    if (conn.responseCode == 200) {
+        val responseText = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        return JSONObject(responseText).getString("id")
+    } else {
+        val errText = try { conn.errorStream?.bufferedReader()?.use { it.readText() } } catch (e: Exception) { null }
+        throw Exception("Cannot resolve OneDrive folder path: HTTP ${conn.responseCode} ${errText ?: ""}")
+    }
+}
+
+fun uploadOneDriveFile(token: String, parentFolderId: String, fileName: String, fileBytes: ByteArray, contentType: String = "application/octet-stream"): OneDriveItem {
+    val encodedName = encodeFileName(fileName)
+    val endpoint = "https://graph.microsoft.com/v1.0/me/drive/items/$parentFolderId:/$encodedName:/content"
+
+    val url = java.net.URL(endpoint)
+    val conn = url.openConnection() as java.net.HttpURLConnection
+    conn.requestMethod = "PUT"
+    conn.connectTimeout = 15000
+    conn.readTimeout = 30000
+    conn.setRequestProperty("Authorization", "Bearer $token")
+    conn.setRequestProperty("Content-Type", contentType)
+    conn.setFixedLengthStreamingMode(fileBytes.size)
+    conn.doOutput = true
+
+    conn.outputStream.use { it.write(fileBytes) }
+
+    if (conn.responseCode == 200 || conn.responseCode == 201) {
+        val res = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        val obj = JSONObject(res)
+        return OneDriveItem(
+            id = obj.getString("id"),
+            name = obj.getString("name"),
+            size = obj.optLong("size", 0L),
+            lastModifiedTime = obj.optString("lastModifiedDateTime", ""),
+            downloadUrl = obj.optString("@microsoft.graph.downloadUrl", null),
+            isFolder = obj.has("folder")
+        )
+    } else {
+        val errText = try { conn.errorStream?.bufferedReader()?.use { it.readText() } } catch (e: Exception) { null }
+        throw Exception("Error uploading $fileName: HTTP ${conn.responseCode} ${errText ?: ""}")
+    }
+}
+
+fun deleteOneDriveFile(token: String, fileId: String) {
+    val endpoint = "https://graph.microsoft.com/v1.0/me/drive/items/$fileId"
+    val url = java.net.URL(endpoint)
+    val conn = url.openConnection() as java.net.HttpURLConnection
+    conn.requestMethod = "DELETE"
+    conn.setRequestProperty("Authorization", "Bearer $token")
+    conn.responseCode // execute
 }
 
 fun createUploadShotsDatabase(
@@ -1602,24 +1858,9 @@ suspend fun uploadSurveyToDrive(
     
     try {
         withContext(Dispatchers.Main) { onLog(getLog(R.string.upload_starting, newName), Color.Cyan) }
-        val account = GoogleSignIn.getLastSignedInAccount(context) ?: return@withContext
-        val credential = GoogleAccountCredential.usingOAuth2(
-            context,
-            Collections.singleton(DriveScopes.DRIVE)
-        ).apply { selectedAccount = account.account }
-        val drive = Drive.Builder(
-            AndroidHttp.newCompatibleTransport(),
-            GsonFactory.getDefaultInstance(),
-            credential
-        ).setApplicationName("CaveArchive").build()
-
-        val folderId = (if (archive.url.contains("/folders/")) {
-            archive.url.split("/folders/").getOrNull(1)?.split("?")?.getOrNull(0)
-        } else if (archive.url.contains("id=")) {
-            archive.url.split("id=").getOrNull(1)?.split("&")?.getOrNull(0)
-        } else {
-            null
-        }) ?: return@withContext
+        val token = getOneDriveToken(context) ?: return@withContext
+        val folderId = resolveOneDriveFolderId(token, archive.url)
+        if (folderId.isBlank()) return@withContext
 
         val parent = DocumentFile.fromTreeUri(context, localFolderUri) ?: return@withContext
         val dbDocFile = parent.findFile("distox14.sqlite") ?: return@withContext
@@ -1729,18 +1970,16 @@ suspend fun uploadSurveyToDrive(
             srcDb.close()
         }
 
-        val cavesFolderId = getOrCreateFolder(drive, folderId, "caves")
-        val projectFolderId = getOrCreateFolder(drive, folderId, "project")
+        val cavesFolderId = getOrCreateOneDriveFolder(token, folderId, "caves")
+        val projectFolderId = getOrCreateOneDriveFolder(token, folderId, "project")
 
         withContext(Dispatchers.Main) {
             onLog(getLog(R.string.upload_cleaning), Color.Cyan)
         }
-        val caveDirFiles =
-            drive.files().list().setQ("'$cavesFolderId' in parents and trashed = false")
-                .setFields("files(id, name)").execute().files ?: emptyList()
+        val caveDirFiles = listOneDriveFolderChildren(token, cavesFolderId)
         caveDirFiles.filter { it.name == "$newName.sqlite" }.forEach {
             try {
-                drive.files().delete(it.id).execute()
+                deleteOneDriveFile(token, it.id)
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     onLog(getLog(R.string.upload_duplicate_warning, it.name), Color.Yellow)
@@ -1749,14 +1988,9 @@ suspend fun uploadSurveyToDrive(
         }
 
         withContext(Dispatchers.Main) { onLog(getLog(R.string.upload_sqlite), Color.Cyan) }
-        val driveFileMetadata =
-            File().apply { setName("$newName.sqlite"); setParents(listOf(cavesFolderId)) }
-        val mediaContent =
-            com.google.api.client.http.FileContent("application/x-sqlite3", uploadSqliteFile)
-        drive.files().create(driveFileMetadata, mediaContent).execute()
+        uploadOneDriveFile(token, cavesFolderId, "$newName.sqlite", uploadSqliteFile.readBytes())
 
-        val rootFiles = drive.files().list().setQ("'$folderId' in parents and trashed = false")
-            .setFields("files(id, name)").execute().files ?: emptyList()
+        val rootFiles = listOneDriveFolderChildren(token, folderId)
         val cavesJsonPattern = Regex("caves([0-9a-fA-F]{5})\\.json")
         val cavesJsonFiles = rootFiles.mapNotNull { f ->
             val match = cavesJsonPattern.matchEntire(f.name)
@@ -1768,9 +2002,7 @@ suspend fun uploadSurveyToDrive(
         val nextName = "caves${nextVersion.toString(16).padStart(5, '0').uppercase()}.json"
 
         val caveJsonObject = if (cavesJsonFiles.isNotEmpty()) {
-            val content =
-                drive.files().get(cavesJsonFiles.first().first.id).executeMediaAsInputStream()
-                    .bufferedReader(Charset.forName("UTF-8")).use { it.readText() }
+            val content = downloadOneDriveText(token, cavesJsonFiles.first().first)
             JSONObject(content)
         } else {
             JSONObject().apply { put("caves", JSONArray()) }
@@ -1794,9 +2026,7 @@ suspend fun uploadSurveyToDrive(
             cavesArray.put(surveyDataJson)
         }
         
-        val projectDirFiles =
-            drive.files().list().setQ("'$projectFolderId' in parents and trashed = false")
-                .setFields("files(id, name)").execute().files ?: emptyList()
+        val projectDirFiles = listOneDriveFolderChildren(token, projectFolderId)
         val tdPattern = Regex("(.+?)([0-9a-fA-F]{5})\\.tdconfig")
 
         var currentProjectPath = caveJsonObject.optString("projectFile")
@@ -1843,8 +2073,7 @@ suspend fun uploadSurveyToDrive(
                 nextTdName = "$baseName${nextVer.toString(16).padStart(5, '0').uppercase()}.tdconfig"
                 nextTdPath = "project/$nextTdName"
 
-                val content = drive.files().get(currentFile.id).executeMediaAsInputStream()
-                    .bufferedReader(Charset.forName("UTF-8")).use { it.readText() }
+                val content = downloadOneDriveText(token, currentFile)
                 val lines = content.lines().toMutableList()
                 val searchPattern = "load \"$newName\""
 
@@ -1877,14 +2106,7 @@ suspend fun uploadSurveyToDrive(
             }
 
             if (updatedTdContent.isNotEmpty()) {
-                val tempTdFile = JFile(context.cacheDir, nextTdName).apply { writeText(updatedTdContent) }
-                val meta = File().apply { setName(nextTdName); setParents(listOf(projectFolderId)) }
-                drive.files().create(
-                    meta,
-                    com.google.api.client.http.FileContent("application/octet-stream", tempTdFile)
-                ).execute()
-                tempTdFile.delete()
-
+                uploadOneDriveFile(token, projectFolderId, nextTdName, updatedTdContent.toByteArray(Charsets.UTF_8))
                 caveJsonObject.put("projectFile", nextTdPath)
 
                 withContext(Dispatchers.Main) {
@@ -1897,25 +2119,17 @@ suspend fun uploadSurveyToDrive(
             }
         }
 
-        val jsonFile =
-            JFile(context.cacheDir, nextName).apply { writeText(caveJsonObject.toString(3)) }
-        val meta = File().apply { setName(nextName); setParents(listOf(folderId)) }
-        drive.files()
-            .create(meta, com.google.api.client.http.FileContent("application/json", jsonFile))
-            .execute()
+        val jsonBytes = caveJsonObject.toString(3).toByteArray(Charsets.UTF_8)
+        uploadOneDriveFile(token, folderId, nextName, jsonBytes, "application/json")
 
-        tempSrcDb.delete(); uploadSqliteFile.delete(); jsonFile.delete()
+        tempSrcDb.delete(); uploadSqliteFile.delete()
         withContext(Dispatchers.Main) {
             onLog(getLog(R.string.upload_completed_version, nextName), Color.Green)
             onLog(getLog(R.string.upload_completed_success), Color.Green)
         }
     } catch (e: Exception) {
         e.printStackTrace()
-        val msg = if (e is GoogleJsonResponseException) {
-            "Drive Error: ${e.details?.message ?: e.message}"
-        } else {
-            e.message ?: e.toString()
-        }
+        val msg = e.message ?: e.toString()
         withContext(Dispatchers.Main) { onLog(getLog(R.string.upload_error, msg), Color.Red) }
     }
 }
@@ -1930,30 +2144,14 @@ suspend fun uploadDemToDrive(
     fun getLog(resId: Int, vararg args: Any): String = context.getString(resId, *args)
     try {
         withContext(Dispatchers.Main) { onLog(getLog(R.string.upload_starting, fileName), Color.Cyan) }
-        val account = GoogleSignIn.getLastSignedInAccount(context) ?: return@withContext
-        val credential = GoogleAccountCredential.usingOAuth2(
-            context,
-            Collections.singleton(DriveScopes.DRIVE)
-        ).apply { selectedAccount = account.account }
-        val drive = Drive.Builder(
-            AndroidHttp.newCompatibleTransport(),
-            GsonFactory.getDefaultInstance(),
-            credential
-        ).setApplicationName("CaveArchive").build()
+        val token = getOneDriveToken(context) ?: return@withContext
+        val folderId = resolveOneDriveFolderId(token, archive.url)
+        if (folderId.isBlank()) return@withContext
 
-        val folderId = (if (archive.url.contains("/folders/")) {
-            archive.url.split("/folders/").getOrNull(1)?.split("?")?.getOrNull(0)
-        } else if (archive.url.contains("id=")) {
-            archive.url.split("id=").getOrNull(1)?.split("&")?.getOrNull(0)
-        } else {
-            null
-        }) ?: return@withContext
-
-        val demFolderId = getOrCreateFolder(drive, folderId, "dem")
+        val demFolderId = getOrCreateOneDriveFolder(token, folderId, "dem")
         
         withContext(Dispatchers.Main) { onLog(getLog(R.string.upload_dem), Color.Cyan) }
         
-        // Use a safe temporary file name to avoid path issues
         val safeTempName = "temp_upload_dem_${System.currentTimeMillis()}"
         val tempFile = JFile(context.cacheDir, safeTempName)
         context.contentResolver.openInputStream(fileUri)?.use { input ->
@@ -1963,13 +2161,9 @@ suspend fun uploadDemToDrive(
         }
 
         val cleanFileName = fileName.split("/").last()
-        val driveFileMetadata = File().apply { setName(cleanFileName); setParents(listOf(demFolderId)) }
-        val mediaContent = com.google.api.client.http.FileContent("application/octet-stream", tempFile)
-        val uploadedFile = drive.files().create(driveFileMetadata, mediaContent).setFields("id").execute()
+        uploadOneDriveFile(token, demFolderId, cleanFileName, tempFile.readBytes())
         
-        // Update caves JSON
-        val rootFiles = drive.files().list().setQ("'$folderId' in parents and trashed = false")
-            .setFields("files(id, name)").execute().files ?: emptyList()
+        val rootFiles = listOneDriveFolderChildren(token, folderId)
         val cavesJsonPattern = Regex("caves([0-9a-fA-F]{5})\\.json")
         val cavesJsonFiles = rootFiles.mapNotNull { f ->
             val match = cavesJsonPattern.matchEntire(f.name)
@@ -1981,8 +2175,7 @@ suspend fun uploadDemToDrive(
         val nextName = "caves${nextVersion.toString(16).padStart(5, '0').uppercase()}.json"
 
         val caveJsonObject = if (cavesJsonFiles.isNotEmpty()) {
-            val content = drive.files().get(cavesJsonFiles.first().first.id).executeMediaAsInputStream()
-                .bufferedReader(Charset.forName("UTF-8")).use { it.readText() }
+            val content = downloadOneDriveText(token, cavesJsonFiles.first().first)
             JSONObject(content)
         } else {
             JSONObject().apply { put("caves", JSONArray()) }
@@ -1990,18 +2183,17 @@ suspend fun uploadDemToDrive(
 
         caveJsonObject.put("demFile", "dem/$cleanFileName")
 
-        val jsonFile = JFile(context.cacheDir, nextName).apply { writeText(caveJsonObject.toString(3)) }
-        val meta = File().apply { setName(nextName); setParents(listOf(folderId)) }
-        drive.files().create(meta, com.google.api.client.http.FileContent("application/json", jsonFile)).execute()
+        val jsonBytes = caveJsonObject.toString(3).toByteArray(Charsets.UTF_8)
+        uploadOneDriveFile(token, folderId, nextName, jsonBytes, "application/json")
 
-        tempFile.delete(); jsonFile.delete()
+        tempFile.delete()
         withContext(Dispatchers.Main) {
             onLog(getLog(R.string.upload_completed_version, nextName), Color.Green)
             onLog(getLog(R.string.upload_completed_success), Color.Green)
         }
     } catch (e: Exception) {
         e.printStackTrace()
-        val msg = if (e is GoogleJsonResponseException) "Drive Error: ${e.details?.message ?: e.message}" else e.message ?: e.toString()
+        val msg = e.message ?: e.toString()
         withContext(Dispatchers.Main) { onLog(getLog(R.string.upload_error, msg), Color.Red) }
     }
 }
@@ -2383,14 +2575,218 @@ suspend fun migrateJsonToDb(context: Context, folderUri: Uri) = withContext(Disp
     }
 }
 
-suspend fun syncDriveFolderOAuth(
-        context: Context,
-        archive: ArchiveConfig,
-        localFolderUri: Uri,
-        onLog: (String, Color) -> Unit,
-        onProgressLog: (String, Color) -> Unit
-    ): Triple<Boolean, String, Int> {
-        return withContext(Dispatchers.IO) {
+class MsalAccessTokenProvider(
+    private val context: Context,
+    private val msalApp: ISingleAccountPublicClientApplication? = null
+) : AccessTokenProvider {
+
+    override fun getAuthorizationToken(
+        uri: java.net.URI,
+        additionalAuthenticationContext: Map<String, Any>?
+    ): String {
+        return runBlocking {
+            getOneDriveToken(context, msalApp) ?: ""
+        }
+    }
+
+    override fun getAllowedHostsValidator(): AllowedHostsValidator {
+        return AllowedHostsValidator("graph.microsoft.com")
+    }
+}
+
+fun getGraphClient(context: Context, msalApp: ISingleAccountPublicClientApplication? = null): GraphServiceClient {
+    val tokenProvider = MsalAccessTokenProvider(context, msalApp)
+    val authProvider = BaseBearerTokenAuthenticationProvider(tokenProvider)
+    return GraphServiceClient(authProvider)
+}
+
+data class OneDriveItem(
+    val id: String,
+    val name: String,
+    val size: Long,
+    val lastModifiedTime: String,
+    val downloadUrl: String?,
+    val isFolder: Boolean
+)
+
+suspend fun getOneDriveToken(
+    context: Context,
+    existingMsalApp: ISingleAccountPublicClientApplication? = null
+): String? {
+    var app = existingMsalApp
+    if (app == null) {
+        app = withContext(Dispatchers.Main) {
+            kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+                PublicClientApplication.createSingleAccountPublicClientApplication(
+                    context.applicationContext,
+                    R.raw.msal_config,
+                    object : IPublicClientApplication.ISingleAccountApplicationCreatedListener {
+                        override fun onCreated(application: ISingleAccountPublicClientApplication) {
+                            if (continuation.isActive) continuation.resume(application)
+                        }
+
+                        override fun onError(exception: MsalException) {
+                            if (continuation.isActive) continuation.resume(null)
+                        }
+                    }
+                )
+            }
+        }
+    }
+
+    val currentApp = app ?: return null
+
+    return withContext(Dispatchers.IO) {
+        kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+            currentApp.getCurrentAccountAsync(object : ISingleAccountPublicClientApplication.CurrentAccountCallback {
+                override fun onAccountLoaded(activeAccount: IAccount?) {
+                    if (activeAccount == null) {
+                        if (continuation.isActive) continuation.resume(null)
+                        return
+                    }
+                    val scopes = arrayOf("Files.ReadWrite", "User.Read")
+                    currentApp.acquireTokenSilentAsync(
+                        scopes,
+                        activeAccount.authority,
+                        object : com.microsoft.identity.client.SilentAuthenticationCallback {
+                            override fun onSuccess(authenticationResult: IAuthenticationResult) {
+                                if (continuation.isActive) continuation.resume(authenticationResult.accessToken)
+                            }
+
+                            override fun onError(exception: MsalException) {
+                                if (continuation.isActive) continuation.resume(null)
+                            }
+                        }
+                    )
+                }
+
+                override fun onAccountChanged(priorAccount: IAccount?, currentAccount: IAccount?) {
+                    if (continuation.isActive) continuation.resume(null)
+                }
+
+                override fun onError(exception: MsalException) {
+                    if (continuation.isActive) continuation.resume(null)
+                }
+            })
+        }
+    }
+}
+
+fun listOneDriveFolderChildren(token: String, folderIdOrUrl: String): List<OneDriveItem> {
+    val items = mutableListOf<OneDriveItem>()
+    val endpoint = when {
+        folderIdOrUrl.startsWith("http://") || folderIdOrUrl.startsWith("https://") -> {
+            val encodedUrl = "u!" + android.util.Base64.encodeToString(
+                folderIdOrUrl.toByteArray(Charsets.UTF_8),
+                android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP
+            )
+            "https://graph.microsoft.com/v1.0/shares/$encodedUrl/driveItem/children"
+        }
+        folderIdOrUrl.contains("/") -> {
+            val cleanPath = folderIdOrUrl.trim('/').split("/").joinToString("/") { encodeFileName(it) }
+            "https://graph.microsoft.com/v1.0/me/drive/root:/$cleanPath:/children"
+        }
+        else -> {
+            "https://graph.microsoft.com/v1.0/me/drive/items/$folderIdOrUrl/children"
+        }
+    }
+
+    var nextLink: String? = endpoint
+    while (nextLink != null) {
+        val url = java.net.URL(nextLink)
+        val conn = url.openConnection() as java.net.HttpURLConnection
+        conn.requestMethod = "GET"
+        conn.connectTimeout = 15000
+        conn.readTimeout = 30000
+        conn.setRequestProperty("Authorization", "Bearer $token")
+        conn.setRequestProperty("Accept", "application/json")
+
+        if (conn.responseCode == 200) {
+            val responseText = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val json = JSONObject(responseText)
+            val array = json.optJSONArray("value") ?: JSONArray()
+            for (i in 0 until array.length()) {
+                val obj = array.getJSONObject(i)
+                val id = obj.getString("id")
+                val name = obj.getString("name")
+                val size = obj.optLong("size", 0L)
+                val modified = obj.optString("lastModifiedDateTime", "")
+                val downloadUrl = obj.optString("@microsoft.graph.downloadUrl", null)
+                val isFolder = obj.has("folder")
+                items.add(OneDriveItem(id, name, size, modified, downloadUrl, isFolder))
+            }
+            val link = json.optString("@odata.nextLink", "")
+            nextLink = if (link.isNotEmpty()) link else null
+        } else {
+            nextLink = null
+        }
+    }
+    return items
+}
+
+fun downloadOneDriveText(token: String, item: OneDriveItem): String {
+    val downloadUrlStr = item.downloadUrl ?: "https://graph.microsoft.com/v1.0/me/drive/items/${item.id}/content"
+    val url = java.net.URL(downloadUrlStr)
+    val conn = url.openConnection() as java.net.HttpURLConnection
+    conn.requestMethod = "GET"
+    conn.connectTimeout = 15000
+    conn.readTimeout = 30000
+    if (item.downloadUrl == null) {
+        conn.setRequestProperty("Authorization", "Bearer $token")
+    }
+    return conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+}
+
+suspend fun downloadOneDriveFileWithProgress(
+    token: String,
+    item: OneDriveItem,
+    outputStream: java.io.OutputStream,
+    onProgress: suspend (Int) -> Unit
+) {
+    val downloadUrlStr = item.downloadUrl ?: "https://graph.microsoft.com/v1.0/me/drive/items/${item.id}/content"
+    val url = java.net.URL(downloadUrlStr)
+    val conn = url.openConnection() as java.net.HttpURLConnection
+    conn.requestMethod = "GET"
+    conn.connectTimeout = 15000
+    conn.readTimeout = 30000
+    if (item.downloadUrl == null) {
+        conn.setRequestProperty("Authorization", "Bearer $token")
+    }
+
+    val totalSize = item.size
+    var totalRead = 0L
+
+    conn.inputStream.use { input ->
+        outputStream.use { output ->
+            val buffer = ByteArray(8192)
+            var bytesRead: Int
+            var lastPct = -1
+            while (input.read(buffer).also { bytesRead = it } != -1) {
+                yield()
+                output.write(buffer, 0, bytesRead)
+                totalRead += bytesRead
+                if (totalSize > 0) {
+                    val pct = (totalRead * 100 / totalSize).toInt()
+                    if (pct != lastPct) {
+                        onProgress(pct)
+                        lastPct = pct
+                    }
+                }
+            }
+            output.flush()
+        }
+    }
+}
+
+suspend fun syncOneDriveFolder(
+    context: Context,
+    msalApp: ISingleAccountPublicClientApplication?,
+    archive: ArchiveConfig,
+    localFolderUri: Uri,
+    onLog: (String, Color) -> Unit,
+    onProgressLog: (String, Color) -> Unit
+): Triple<Boolean, String, Int> {
+    return withContext(Dispatchers.IO) {
         suspend fun safeLog(text: String, color: Color = Color.White) =
             withContext(Dispatchers.Main) { onLog(text, color) }
 
@@ -2398,7 +2794,7 @@ suspend fun syncDriveFolderOAuth(
             withContext(Dispatchers.Main) { onProgressLog(text, color) }
 
         fun checkCancelled(): Boolean = !isActive
-        
+
         fun getLog(resId: Int, vararg args: Any): String = context.getString(resId, *args)
 
         suspend fun <T> runWithRetry(name: String, block: () -> T): T {
@@ -2407,7 +2803,7 @@ suspend fun syncDriveFolderOAuth(
             for (i in 1..3) {
                 yield()
                 try {
-                    return withTimeout(180000) { 
+                    return withTimeout(180000) {
                         kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
                             block()
                         }
@@ -2420,74 +2816,24 @@ suspend fun syncDriveFolderOAuth(
                     if (i < 3) {
                         safeLog("Retry $i/3: $name (${t.localizedMessage ?: "Error"})", Color.Yellow)
                         delay(currentDelay)
-                        currentDelay *= 2 
+                        currentDelay *= 2
                     }
                 }
             }
             throw lastEx ?: Exception("Task $name failed")
         }
 
-        suspend fun downloadFileWithProgress(
-            drive: Drive,
-            driveFileId: String,
-            fileName: String,
-            outputStream: java.io.OutputStream
-        ) {
-            val fileMeta = drive.files().get(driveFileId).setFields("size").execute()
-            val totalSize = fileMeta.getSize() ?: -1L
-            var totalRead = 0L
-
-            safeLog(getLog(R.string.sync_downloading, fileName), Color.Gray)
-
-            val inputStream = drive.files().get(driveFileId).executeMediaAsInputStream()
-            inputStream.use { input ->
-                outputStream.use { output ->
-                    val buffer = ByteArray(8192)
-                    var bytesRead: Int
-                    var lastPct = -1
-                    while (input.read(buffer).also { bytesRead = it } != -1) {
-                        yield()
-                        output.write(buffer, 0, bytesRead)
-                        totalRead += bytesRead
-                        if (totalSize > 0) {
-                            val pct = (totalRead * 100 / totalSize).toInt()
-                            if (pct != lastPct) {
-                                safeUpdateLog(getLog(R.string.sync_downloading_pct, fileName, pct), Color.Gray)
-                                lastPct = pct
-                            }
-                        }
-                    }
-                    output.flush()
-                }
-            }
-        }
-
         try {
-            val account = GoogleSignIn.getLastSignedInAccount(context)
-                ?: return@withContext Triple(false, context.getString(R.string.btn_google_login), 0)
-            val credential = GoogleAccountCredential.usingOAuth2(
-                context,
-                Collections.singleton(DriveScopes.DRIVE)
-            ).apply { selectedAccount = account.account }
-            val drive = Drive.Builder(
-                AndroidHttp.newCompatibleTransport(),
-                GsonFactory.getDefaultInstance(),
-                credential
-            ).setApplicationName("CaveArchive").build()
+            val token = getOneDriveToken(context, msalApp)
+                ?: return@withContext Triple(false, context.getString(R.string.btn_onedrive_login), 0)
 
-            val folderId =
-                if (archive.url.contains("/folders/")) archive.url.split("/folders/").getOrNull(1)
-                    ?.split("?")?.getOrNull(0)
-                else if (archive.url.contains("id=")) archive.url.split("id=").getOrNull(1)
-                    ?.split("&")?.getOrNull(0)
-                else null
-            if (folderId == null) return@withContext Triple(false, getLog(R.string.sync_error_invalid_url), 0)
+            val folderId = resolveOneDriveFolderId(token, archive.url)
+            if (folderId.isBlank()) return@withContext Triple(false, getLog(R.string.sync_error_invalid_url), 0)
 
             safeLog(getLog(R.string.sync_connecting), Color.Cyan)
             val rootFiles = runWithRetry("file list") {
-                drive.files().list().setQ("'$folderId' in parents and trashed = false")
-                    .setFields("files(id, name)").execute()
-            }.files ?: emptyList()
+                listOneDriveFolderChildren(token, folderId)
+            }
 
             val cavesJsonPattern = Regex("caves([0-9a-fA-F]{5})\\.json")
             val latestCavesFile = rootFiles.mapNotNull { f ->
@@ -2498,13 +2844,12 @@ suspend fun syncDriveFolderOAuth(
 
             safeLog(getLog(R.string.sync_using_config, latestCavesFile.name), Color.Green)
             val jsonStr = runWithRetry("download ${latestCavesFile.name}") {
-                drive.files().get(latestCavesFile.id).executeMediaAsInputStream().bufferedReader()
-                    .use { it.readText() }
+                downloadOneDriveText(token, latestCavesFile)
             }
             val caveJsonObject = JSONObject(jsonStr)
             val caves = caveJsonObject.getJSONArray("caves")
 
-            val cavesFolderId = rootFiles.find { it.name.equals("caves", true) }?.id
+            val cavesFolderItem = rootFiles.find { it.name.equals("caves", true) && it.isFolder }
 
             val validCaveNames = mutableSetOf<String>()
             val validFilesPaths = mutableSetOf<String>()
@@ -2526,10 +2871,11 @@ suspend fun syncDriveFolderOAuth(
                     SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
                         ensureCaveArchiveColumn(db)
 
-                        val remoteCaveFiles = if (cavesFolderId != null) drive.files().list()
-                            .setQ("'$cavesFolderId' in parents and trashed = false")
-                            .setFields("files(id, name, modifiedTime)").execute().files
-                            ?: emptyList() else emptyList()
+                        val remoteCaveFiles = if (cavesFolderItem != null) {
+                            runWithRetry("list caves folder") {
+                                listOneDriveFolderChildren(token, cavesFolderItem.id)
+                            }
+                        } else emptyList()
 
                         db.beginTransaction()
                         try {
@@ -2537,8 +2883,7 @@ suspend fun syncDriveFolderOAuth(
                                 if (checkCancelled()) break
                                 val cave = caves.getJSONObject(i)
                                 val name = cave.getString("name")
-                                val sNameWithPath =
-                                    cave.getString("shotsFile") 
+                                val sNameWithPath = cave.getString("shotsFile")
                                 val sName = sNameWithPath.split("/").last()
                                 validCaveNames.add(sName)
 
@@ -2574,7 +2919,7 @@ suspend fun syncDriveFolderOAuth(
                                 if (cave.has("fixeds")) {
                                     val fixedsItem = cave.get("fixeds")
                                     val fixedsArray = if (fixedsItem is JSONArray) fixedsItem else JSONArray().put(fixedsItem)
-                                    
+
                                     for (j in 0 until fixedsArray.length()) {
                                         val f = fixedsArray.getJSONObject(j)
                                         val station = f.optString("station", "")
@@ -2591,7 +2936,7 @@ suspend fun syncDriveFolderOAuth(
                                             put("cs_latitude", 0.0); put("cs_altitude", 0.0); put("source", 2)
                                             put("cs_decimals", 2); put("convergence", 0.0)
                                         }
-                                        
+
                                         db.query("fixeds", arrayOf("id"), "surveyId = ? AND station = ?", arrayOf(sId.toString(), station), null, null, null).use { c ->
                                             if (cursorToFirst(c)) {
                                                 db.update("fixeds", fv, "id = ?", arrayOf(c.getInt(0).toString()))
@@ -2604,7 +2949,7 @@ suspend fun syncDriveFolderOAuth(
 
                                 val sFile = remoteCaveFiles.find { it.name == sName }
                                 if (sFile != null) {
-                                    val currentModifiedTime = sFile.modifiedTime?.toString() ?: ""
+                                    val currentModifiedTime = sFile.lastModifiedTime
                                     var needsUpdate = true
                                     db.query("CA_Surveys", arrayOf("modified_time"), "archiveId = ? AND file_name = ?", arrayOf(archive.id.toString(), sName), null, null, null).use { mc ->
                                         if (mc.moveToFirst() && mc.getString(0) == currentModifiedTime) needsUpdate = false
@@ -2616,7 +2961,12 @@ suspend fun syncDriveFolderOAuth(
                                         val tShots = JFile(context.cacheDir, "temp_shots.sqlite")
                                         runWithRetry("download $sName") {
                                             context.contentResolver.openOutputStream(Uri.fromFile(tShots))?.use { out ->
-                                                kotlinx.coroutines.runBlocking { downloadFileWithProgress(drive, sFile.id, sName, out) }
+                                                kotlinx.coroutines.runBlocking {
+                                                    safeLog(getLog(R.string.sync_downloading, sName), Color.Gray)
+                                                    downloadOneDriveFileWithProgress(token, sFile, out) { pct ->
+                                                        safeUpdateLog(getLog(R.string.sync_downloading_pct, sName, pct), Color.Gray)
+                                                    }
+                                                }
                                             }
                                         }
 
@@ -2624,7 +2974,7 @@ suspend fun syncDriveFolderOAuth(
                                             put("archiveId", archive.id); put("file_name", sName)
                                             put("drive_id", sFile.id); put("modified_time", currentModifiedTime)
                                         }
-                                        if (db.update("CA_Surveys", metaVals, "archiveId = ? AND file_name = ?", arrayOf(archive.id.toString(), sName)) == 0) 
+                                        if (db.update("CA_Surveys", metaVals, "archiveId = ? AND file_name = ?", arrayOf(archive.id.toString(), sName)) == 0)
                                             db.insert("CA_Surveys", null, metaVals)
 
                                         SQLiteDatabase.openDatabase(tShots.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { sDb ->
@@ -2633,7 +2983,7 @@ suspend fun syncDriveFolderOAuth(
                                                 if (cursorToFirst(sc)) do {
                                                     val row = ContentValues()
                                                     for (col in sc.columnNames) {
-                                                        if (col == "caveArchive") continue 
+                                                        if (col == "caveArchive") continue
                                                         val idx = sc.getColumnIndex(col)
                                                         when (sc.getType(idx)) {
                                                             Cursor.FIELD_TYPE_INTEGER -> row.put(col, sc.getLong(idx))
@@ -2682,7 +3032,7 @@ suspend fun syncDriveFolderOAuth(
 
                 for (j in 0 until jsonArray.length()) {
                     if (checkCancelled()) break
-                    val fullPath = jsonArray.getString(j) 
+                    val fullPath = jsonArray.getString(j)
                     validFilesPaths.add(fullPath)
                     val parts = fullPath.split("/")
                     if (parts.size != 2) continue
@@ -2690,12 +3040,12 @@ suspend fun syncDriveFolderOAuth(
                     val remoteDirName = parts[0]
                     val fileNameWithExt = parts[1]
 
-                    val remoteFolderId = rootFiles.find { it.name.equals(remoteDirName, true) }?.id
-                    if (remoteFolderId == null) continue
+                    val remoteFolderItem = rootFiles.find { it.name.equals(remoteDirName, true) && it.isFolder }
+                    if (remoteFolderItem == null) continue
 
-                    val remoteFiles = drive.files().list()
-                        .setQ("'$remoteFolderId' in parents and trashed = false")
-                        .setFields("files(id, name, modifiedTime)").execute().files ?: emptyList()
+                    val remoteFiles = runWithRetry("list $remoteDirName") {
+                        listOneDriveFolderChildren(token, remoteFolderItem.id)
+                    }
 
                     val baseMatch = versionPattern.matchEntire(fileNameWithExt)
                     val baseName = baseMatch?.groupValues?.get(1) ?: fileNameWithExt.split(".").first()
@@ -2712,7 +3062,7 @@ suspend fun syncDriveFolderOAuth(
                         ?: remoteFiles.find { it.name == fileNameWithExt }
 
                     if (latestRemoteFile != null) {
-                        val currentModifiedTime = latestRemoteFile.modifiedTime?.toString() ?: ""
+                        val currentModifiedTime = latestRemoteFile.lastModifiedTime
                         var needsUpdate = true
 
                         val tempDbFile = JFile(context.cacheDir, "meta_check.sqlite")
@@ -2734,7 +3084,12 @@ suspend fun syncDriveFolderOAuth(
                                 val tempDownloadFile = JFile(context.cacheDir, "temp_download_${System.currentTimeMillis()}")
                                 runWithRetry("download ${latestRemoteFile.name}") {
                                     FileOutputStream(tempDownloadFile).use { out ->
-                                        kotlinx.coroutines.runBlocking { downloadFileWithProgress(drive, latestRemoteFile.id, latestRemoteFile.name, out) }
+                                        kotlinx.coroutines.runBlocking {
+                                            safeLog(getLog(R.string.sync_downloading, latestRemoteFile.name), Color.Gray)
+                                            downloadOneDriveFileWithProgress(token, latestRemoteFile, out) { pct ->
+                                                safeUpdateLog(getLog(R.string.sync_downloading_pct, latestRemoteFile.name, pct), Color.Gray)
+                                            }
+                                        }
                                     }
                                 }
 
@@ -2754,7 +3109,7 @@ suspend fun syncDriveFolderOAuth(
                                     context.contentResolver.openOutputStream(t.uri)?.use { out ->
                                         tempDownloadFile.inputStream().use { it.copyTo(out) }
                                     }
-                                    
+
                                     updateFilesInventorySuspend(
                                         context, localFolderUri, archive.id,
                                         listOf(JSONObject().apply {
@@ -2783,10 +3138,10 @@ suspend fun syncDriveFolderOAuth(
                 val tempDb = JFile(context.cacheDir, "cleanup_temp.sqlite")
                 context.contentResolver.openInputStream(dbDocFile.uri)
                     ?.use { input -> FileOutputStream(tempDb).use { input.copyTo(it) } }
-                
+
                 SQLiteDatabase.openOrCreateDatabase(tempDb, null).use { db ->
                     ensureCaveArchiveColumn(db)
-                    
+
                     // 1. Cleanup Surveys (SQLite)
                     db.query("CA_Surveys", arrayOf("file_name"), "archiveId = ?", arrayOf(archive.id.toString()), null, null, null).use { cursor ->
                         while (cursor.moveToNext()) {
@@ -2795,7 +3150,6 @@ suspend fun syncDriveFolderOAuth(
                                 val surveyName = fileName.removeSuffix(".sqlite")
                                 db.delete("surveys", "name = ? AND archiveId = ?", arrayOf(surveyName, archive.id.toString()))
                                 db.delete("CA_Surveys", "file_name = ? AND archiveId = ?", arrayOf(fileName, archive.id.toString()))
-                                // Cascade delete shots/fixeds is handled by not being in surveys
                                 db.execSQL("DELETE FROM shots WHERE surveyId NOT IN (SELECT id FROM surveys)")
                                 db.execSQL("DELETE FROM fixeds WHERE surveyId NOT IN (SELECT id FROM surveys)")
                                 totalUpdates++
@@ -2809,7 +3163,6 @@ suspend fun syncDriveFolderOAuth(
                             val cloudPath = cursor.getString(0)
                             val localPath = cursor.getString(1)
                             if (!validFilesPaths.contains(cloudPath)) {
-                                // Delete local file
                                 if (!localPath.isNullOrEmpty()) {
                                     val lpParts = localPath.split("/")
                                     if (lpParts.size == 2) {
@@ -2822,7 +3175,7 @@ suspend fun syncDriveFolderOAuth(
                         }
                     }
                 }
-                
+
                 context.contentResolver.openOutputStream(dbDocFile.uri, "wt")?.use { output ->
                     tempDb.inputStream().use { input -> input.copyTo(output) }
                     output.flush()
@@ -2902,6 +3255,48 @@ suspend fun updateFilesInventorySuspend(
     }
 }
 
+@Composable
+fun OneDriveNoticeDialog(
+    onDismiss: (Boolean) -> Unit
+) {
+    var dontShowAgain by remember { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = { onDismiss(dontShowAgain) },
+        title = { Text(stringResource(R.string.onedrive_notice_title)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    text = stringResource(R.string.onedrive_notice_message),
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Spacer(Modifier.height(4.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.clickable { dontShowAgain = !dontShowAgain }
+                ) {
+                    Checkbox(
+                        checked = dontShowAgain,
+                        onCheckedChange = { dontShowAgain = it }
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = stringResource(R.string.onedrive_notice_dont_show_again),
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onDismiss(dontShowAgain) }
+            ) {
+                Text(stringResource(R.string.btn_ok))
+            }
+        }
+    )
+}
+
 @Preview(showBackground = true)
 @Composable
 fun MainScreenPreview() {
@@ -2921,6 +3316,7 @@ fun MainScreenPreview() {
             showMenu = false,
             archives = emptyList(),
             onActiveDialogChange = {},
+            onSetDontShowOneDriveNotice = {},
             onWipeAllDataChange = {},
             onArchiveToWipeChange = {},
             onShowMenuChange = {},

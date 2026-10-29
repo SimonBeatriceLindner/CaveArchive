@@ -15,8 +15,8 @@ android {
         applicationId = "com.cavearchive.app"
         minSdk = 30
         targetSdk = 36
-        versionCode = 12
-        versionName = "1.1.10"
+        versionCode = 13
+        versionName = "1.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -56,12 +56,10 @@ dependencies {
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.material.icons.extended)
     implementation(libs.androidx.documentfile)
-    implementation(libs.play.services.auth)
-    implementation(libs.google.api.client)
-    implementation(libs.google.api.client.android)
-    implementation(libs.google.api.services.drive)
-    implementation(libs.google.http.client.gson)
-    implementation("com.google.http-client:google-http-client-android:1.44.1")
+    implementation(libs.msal) {
+        exclude(group = "com.microsoft.device.display", module = "display-mask")
+    }
+    implementation(libs.microsoft.graph)
     implementation(libs.guava)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)

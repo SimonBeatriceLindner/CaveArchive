@@ -3,10 +3,10 @@
 
     <!-- Main Screen -->
     <string name="app_title">CaveArchive</string>
-    <string name="main_subtitle">Synchronize TopoDroid surveys to Google Drive</string>
+    <string name="main_subtitle">Synchronize TopoDroid surveys to OneDrive</string>
     <string name="btn_sync">Sync</string>
     <string name="btn_stop_sync">Stop Sync</string>
-    <string name="btn_google_login">Google Login</string>
+    <string name="btn_onedrive_login">OneDrive Login</string>
     <string name="status_syncing">Syncing...</string>
     <string name="status_stopping">Stopping...</string>
     <string name="label_configuration">Configuration:</string>
@@ -32,6 +32,11 @@
     <string name="info_email">Email: </string>
     <string name="info_bugs_suggestion">Please report bugs and suggest new features.</string>
 
+    <!-- OneDrive Migration Notice Dialog -->
+    <string name="onedrive_notice_title">Important Notice: OneDrive Migration</string>
+    <string name="onedrive_notice_message">We are moving remote file management from Google Drive to Microsoft OneDrive. Please be aware that repositories and synchronization will be transitioned to OneDrive in upcoming updates. Simply move all the archive files into OneDrive folders and use the sharing link within CaveArchive, just as you have been doing until now with Google Drive. Read more on our site</string>
+    <string name="onedrive_notice_dont_show_again">Do not show this message again</string>
+
     <!-- Wipe Dialog -->
     <string name="wipe_title">Wipe Managed Data</string>
     <string name="wipe_confirmation">Are you sure you want to delete data synchronized with CaveArchive?</string>
@@ -46,14 +51,14 @@
     <string name="settings_title">Settings</string>
     <string name="label_storage_folder">Storage Folder:</string>
     <string name="btn_change">Change</string>
-    <string name="label_drive_archives">Drive Archives:</string>
+    <string name="label_drive_archives">OneDrive Archives:</string>
     <string name="btn_add_archive">Add Archive</string>
-    <string name="desc_open_drive">Open in Drive</string>
+    <string name="desc_open_drive">Open in OneDrive</string>
     <string name="toast_cannot_open_url">Cannot open URL</string>
     <string name="dialog_new_archive">New</string>
     <string name="dialog_edit_archive">Edit</string>
     <string name="label_name">Name</string>
-    <string name="label_drive_url">Drive URL</string>
+    <string name="label_drive_url">OneDrive URL</string>
     <string name="btn_save">Save</string>
 
     <!-- Upload Dialog -->
@@ -90,11 +95,13 @@
     <string name="log_error_general">ERROR: %1$s</string>
     <string name="log_wipe_id_error">Error: Archive ID not valid. Please restart the app.</string>
     <string name="log_logged_out">Logged out</string>
-    <string name="log_login_success">Google Login successful</string>
-    <string name="log_login_error">Google Login error: %1$s</string>
+    <string name="log_onedrive_login_success">OneDrive Login successful</string>
+    <string name="log_onedrive_login_error">OneDrive Login error: %1$s</string>
+    <string name="log_login_cancelled">Login cancelled</string>
+    <string name="log_msal_not_initialized">OneDrive authentication client not initialized</string>
 
     <!-- Drive / Sync logic messages (used in code) -->
-    <string name="sync_connecting">Connecting to Drive...</string>
+    <string name="sync_connecting">Connecting to OneDrive...</string>
     <string name="sync_using_config">Using config: %1$s</string>
     <string name="sync_config_not_found">cavesXXXXX.json not found</string>
     <string name="sync_updating_db">Updating DB...</string>
@@ -106,7 +113,7 @@
     <string name="sync_interrupted">Interrupted.</string>
     <string name="sync_error">Error: %1$s</string>
     <string name="sync_error_invalid_url">Invalid URL</string>
-    <string name="sync_error_shots_not_found">ERROR: Shots file \'%1$s\' not found in Drive caves/ folder!</string>
+    <string name="sync_error_shots_not_found">ERROR: Shots file \'%1$s\' not found in OneDrive caves/ folder!</string>
 
     <string name="upload_starting">Starting upload: %1$s</string>
     <string name="upload_processing">Processing Survey ID: %1$d (%2$s)</string>

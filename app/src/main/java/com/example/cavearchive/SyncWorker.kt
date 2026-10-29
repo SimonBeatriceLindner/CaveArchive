@@ -4,20 +4,13 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.graphics.BitmapFactory
 import androidx.core.app.NotificationCompat
 import androidx.core.net.toUri
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
-import com.google.android.gms.auth.api.signin.GoogleSignIn
-import com.google.api.client.extensions.android.http.AndroidHttp
-import com.google.api.client.googleapis.extensions.android.gms.auth.GoogleAccountCredential
-import com.google.api.client.json.gson.GsonFactory
-import com.google.api.services.drive.Drive
-import com.google.api.services.drive.DriveScopes
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.util.Collections
-import androidx.compose.ui.graphics.Color
 
 class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
 
@@ -36,33 +29,14 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         var updatedCount = 0
 
         try {
-            val account = GoogleSignIn.getLastSignedInAccount(applicationContext) ?: return@withContext Result.retry()
-            val credential = GoogleAccountCredential.usingOAuth2(
-                applicationContext,
-                Collections.singleton(DriveScopes.DRIVE_READONLY)
-            ).apply { selectedAccount = account.account }
-            
-            val drive = Drive.Builder(
-                AndroidHttp.newCompatibleTransport(),
-                GsonFactory.getDefaultInstance(),
-                credential
-            ).setApplicationName("CaveArchive").build()
+            val token = getOneDriveToken(applicationContext) ?: return@withContext Result.retry()
 
             for (archive in autoSyncArchives) {
                 try {
-                    val folderId = (if (archive.url.contains("/folders/")) {
-                        archive.url.split("/folders/").getOrNull(1)?.split("?")?.getOrNull(0)
-                    } else if (archive.url.contains("id=")) {
-                        archive.url.split("id=").getOrNull(1)?.split("&")?.getOrNull(0)
-                    } else {
-                        null
-                    }) ?: continue
+                    val folderIdOrUrl = archive.url.trim()
+                    if (folderIdOrUrl.isBlank()) continue
 
-                    // Check quick timestamp
-                    val rootFiles = drive.files().list()
-                        .setQ("'$folderId' in parents and trashed = false")
-                        .setFields("files(id, name, modifiedTime)")
-                        .execute().files ?: emptyList()
+                    val rootFiles = listOneDriveFolderChildren(token, folderIdOrUrl)
 
                     val cavesJsonPattern = Regex("caves([0-9a-fA-F]{5})\\.json")
                     val latestCavesFile = rootFiles.mapNotNull { f ->
@@ -70,13 +44,14 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
                         if (match != null) f to match.groupValues[1].toInt(16) else null
                     }.maxByOrNull { it.second }?.first ?: continue
 
-                    val remoteModifiedTime = latestCavesFile.modifiedTime?.toString() ?: ""
+                    val remoteModifiedTime = latestCavesFile.lastModifiedTime
                     val lastSyncTime = sharedPrefs.getString("last_remote_sync_time_${archive.id}", "")
 
                     if (remoteModifiedTime.isNotEmpty() && remoteModifiedTime == lastSyncTime) continue
 
-                    val (success, _, totalUpdates) = syncDriveFolderOAuth(
+                    val (success, _, totalUpdates) = syncOneDriveFolder(
                         applicationContext,
+                        null,
                         archive,
                         folderUri,
                         { _, _ -> },
@@ -121,14 +96,25 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         )
 
         val notificationManager = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val notification = NotificationCompat.Builder(applicationContext, "sync_channel")
-            .setSmallIcon(R.mipmap.cave_icon)
+
+        val largeIcon = try {
+            BitmapFactory.decodeResource(applicationContext.resources, R.mipmap.cave_icon)
+        } catch (_: Exception) {
+            null
+        }
+
+        val notificationBuilder = NotificationCompat.Builder(applicationContext, "sync_channel")
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(title)
             .setContentText(message)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
-            .build()
-        notificationManager.notify(1001, notification)
+
+        if (largeIcon != null) {
+            notificationBuilder.setLargeIcon(largeIcon)
+        }
+
+        notificationManager.notify(1001, notificationBuilder.build())
     }
 }

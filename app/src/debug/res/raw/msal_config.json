@@ -1,0 +1,16 @@
+{
+  "client_id" : "59da1e9c-e04a-4df3-9a2a-7c85ceaee57f",
+  "authorization_user_agent" : "WEBVIEW",
+  "redirect_uri" : "msauth://com.cavearchive.app/9JINOnfjzjkhwBVv2yXFsVAX5LY%3D",
+  "account_mode" : "SINGLE",
+  "broker_redirect_uri_registered" : false,
+  "authorities" : [
+    {
+      "type": "AAD",
+      "audience": {
+        "type": "AzureADandPersonalMicrosoftAccount",
+        "tenant_id": "common"
+      }
+    }
+  ]
+}
