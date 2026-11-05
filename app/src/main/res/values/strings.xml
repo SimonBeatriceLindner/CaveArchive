@@ -51,7 +51,7 @@
     <string name="settings_title">Settings</string>
     <string name="label_storage_folder">Storage Folder:</string>
     <string name="btn_change">Change</string>
-    <string name="label_drive_archives">OneDrive Archives:</string>
+    <string name="label_drive_archives">Archives:</string>
     <string name="btn_add_archive">Add Archive</string>
     <string name="desc_open_drive">Open in OneDrive</string>
     <string name="toast_cannot_open_url">Cannot open URL</string>

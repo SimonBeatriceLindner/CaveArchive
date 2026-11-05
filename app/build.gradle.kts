@@ -13,7 +13,7 @@ android {
 
     defaultConfig {
         applicationId = "com.cavearchive.app"
-        minSdk = 30
+        minSdk = 26
         targetSdk = 36
         versionCode = 13
         versionName = "1.2.0"
@@ -60,6 +60,9 @@ dependencies {
         exclude(group = "com.microsoft.device.display", module = "display-mask")
     }
     implementation(libs.microsoft.graph)
+    implementation(libs.zxing.core)
+    implementation(libs.zxing.embedded)
+    implementation(libs.commons.net)
     implementation(libs.guava)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
