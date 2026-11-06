@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.compose.ui.graphics.Color
 import com.microsoft.identity.client.ISingleAccountPublicClientApplication
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.apache.commons.net.ftp.FTP
 import org.apache.commons.net.ftp.FTPClient
@@ -244,23 +245,30 @@ class FtpRepositoryProvider(
         withFtp { ftp ->
             val totalBytes = item.size
             var bytesDownloaded = 0L
+            var lastReportedPct = -1
 
             val countingOut = object : FilterOutputStream(outputStream) {
                 override fun write(b: Int) {
                     out.write(b)
                     bytesDownloaded++
-                    if (totalBytes > 0) {
-                        val pct = ((bytesDownloaded * 100) / totalBytes).toInt().coerceIn(0, 100)
-                        kotlinx.coroutines.runBlocking { onProgress(pct) }
-                    }
+                    reportProgress()
                 }
 
                 override fun write(b: ByteArray, off: Int, len: Int) {
                     out.write(b, off, len)
                     bytesDownloaded += len
+                    reportProgress()
+                }
+
+                private fun reportProgress() {
                     if (totalBytes > 0) {
                         val pct = ((bytesDownloaded * 100) / totalBytes).toInt().coerceIn(0, 100)
-                        kotlinx.coroutines.runBlocking { onProgress(pct) }
+                        if (pct != lastReportedPct) {
+                            lastReportedPct = pct
+                            kotlinx.coroutines.CoroutineScope(Dispatchers.Main).launch {
+                                try { onProgress(pct) } catch (e: Exception) {}
+                            }
+                        }
                     }
                 }
             }

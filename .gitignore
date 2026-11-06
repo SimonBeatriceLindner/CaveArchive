@@ -13,3 +13,4 @@ app/release/
 .externalNativeBuild
 .cxx
 local.properties
+/prompts
